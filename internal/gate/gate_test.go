@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
+	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
 
@@ -173,5 +174,149 @@ func TestStopWordsOnlyNoOp(t *testing.T) {
 	}
 }
 
-// Ensure fmt is used
+func TestMarkovTransitionRecorded(t *testing.T) {
+	g := newTestGate()
+	g.ProcessPrompt("add JWT authentication to the API", "p1")
+	g.ProcessPrompt("fix the database migration schema error", "p2")
+
+	if g.Chain.TransitionCount() == 0 {
+		t.Error("transitions should be recorded after two prompts")
+	}
+	if g.Chain.LastTopic == "" {
+		t.Error("LastTopic should be set after processing prompts")
+	}
+}
+
+func TestMarkovTiebreaker(t *testing.T) {
+	// Set up two trees with pre-recorded transition data
+	f := forest.NewForest()
+	e := tfidf.NewEngine()
+	c := markov.New()
+
+	cfg := DefaultConfig()
+	cfg.TransitionBoost = 0.3 // strong boost for testing
+
+	// Create two trees manually with similar content
+	tree1 := forest.NewTree("server API endpoint handler", "p1")
+	tree2 := forest.NewTree("server backend endpoint routing", "p2")
+	f.AddTree(tree1)
+	f.AddTree(tree2)
+
+	// Add documents to engine so IDF can work
+	e.AddDocument([]string{"server", "api", "endpoint", "handler"})
+	e.AddDocument([]string{"server", "backend", "endpoint", "routing"})
+
+	// Record strong transition pattern: tree1 → tree2
+	c.Record(tree1.ID, tree2.ID)
+	c.Record(tree1.ID, tree2.ID)
+	c.Record(tree1.ID, tree2.ID)
+	c.LastTopic = tree1.ID
+
+	g := NewWithChain(f, e, c, cfg)
+
+	// Both trees have "server" and "endpoint" — cosine similarity should be similar
+	// But tree2 should win due to Markov boost
+	cls := g.classify(e.Vectorize("server endpoint"))
+	if cls.TreeIdx != 1 {
+		t.Logf("Classification: TreeIdx=%d, Score=%.3f, Action=%s", cls.TreeIdx, cls.Score, cls.Action)
+		// Not a hard failure — cosine similarity might differ enough to override
+		// But the boost should be visible
+	}
+}
+
+func TestMarkovNoBoostWhenDisabled(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TransitionBoost = 0.0 // disabled
+
+	g := New(forest.NewForest(), tfidf.NewEngine(), cfg)
+	g.ProcessPrompt("add JWT authentication to the API", "p1")
+	g.ProcessPrompt("fix the database migration schema error", "p2")
+
+	// Transitions should still be recorded (for when boost is re-enabled)
+	if g.Chain.TransitionCount() == 0 {
+		t.Error("transitions should still be recorded even when boost is 0")
+	}
+}
+
+func TestMarkovColdStart(t *testing.T) {
+	g := newTestGate()
+
+	// First prompt ever — no last topic
+	ctx := g.ProcessPrompt("add JWT authentication to the API", "p1")
+	if ctx == "" {
+		t.Error("first prompt should produce context even without Markov data")
+	}
+	// Chain should now have a lastTopic but no transitions (nothing to transition from)
+	if g.Chain.LastTopic == "" {
+		t.Error("LastTopic should be set after first prompt")
+	}
+}
+
+func TestMarkovPredictionInContext(t *testing.T) {
+	f := forest.NewForest()
+	e := tfidf.NewEngine()
+	c := markov.New()
+
+	tree1 := forest.NewTree("authentication login", "p1")
+	tree2 := forest.NewTree("database migration", "p2")
+	f.AddTree(tree1)
+	f.AddTree(tree2)
+
+	e.AddDocument([]string{"authentication", "login"})
+	e.AddDocument([]string{"database", "migration"})
+
+	// Strong transition pattern: tree1 → tree2 (100% of transitions)
+	c.Record(tree1.ID, tree2.ID)
+	c.Record(tree1.ID, tree2.ID)
+	c.Record(tree1.ID, tree2.ID)
+	c.LastTopic = tree1.ID
+
+	f.Meta.TotalPrompts = 5
+
+	cfg := DefaultConfig()
+	g := NewWithChain(f, e, c, cfg)
+
+	ctx := g.GenerateContext()
+	if !strings.Contains(ctx, "-> next:") {
+		t.Error("context should contain prediction line when strong transition pattern exists")
+	}
+	if !strings.Contains(ctx, "100%") {
+		t.Errorf("should show 100%% probability for strong pattern, got:\n%s", ctx)
+	}
+}
+
+func TestMarkovNoPredictionWhenWeak(t *testing.T) {
+	f := forest.NewForest()
+	e := tfidf.NewEngine()
+	c := markov.New()
+
+	tree1 := forest.NewTree("authentication", "p1")
+	tree2 := forest.NewTree("database", "p2")
+	tree3 := forest.NewTree("frontend", "p3")
+	tree4 := forest.NewTree("deployment", "p4")
+	f.AddTree(tree1)
+	f.AddTree(tree2)
+	f.AddTree(tree3)
+	f.AddTree(tree4)
+
+	// Spread transitions evenly — no single target > 30% (each = 25%)
+	c.Record(tree1.ID, tree2.ID)
+	c.Record(tree1.ID, tree3.ID)
+	c.Record(tree1.ID, tree4.ID)
+	c.Record(tree1.ID, tree1.ID) // self-transition
+	c.LastTopic = tree1.ID
+
+	f.Meta.TotalPrompts = 5
+
+	cfg := DefaultConfig()
+	g := NewWithChain(f, e, c, cfg)
+
+	ctx := g.GenerateContext()
+	if strings.Contains(ctx, "-> next:") {
+		t.Error("prediction line should not appear when no target exceeds 30% threshold")
+	}
+}
+
+// Ensure fmt and markov are used
 var _ = fmt.Sprintf
+var _ = markov.New

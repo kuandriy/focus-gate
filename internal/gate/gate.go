@@ -6,31 +6,34 @@ import (
 	"strings"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
+	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
 
 // Config holds gate classification parameters.
 type Config struct {
-	ExtendThreshold  float64 `json:"extend"`
-	BranchThreshold  float64 `json:"branch"`
-	BubbleUpTerms    int     `json:"bubbleUpTerms"`
-	MaxSourcesPerNode int    `json:"maxSourcesPerNode"`
-	MemorySize       int     `json:"memorySize"`
-	DecayRate        float64 `json:"decayRate"`
-	ContextLimit     int     `json:"contextLimit"`
+	ExtendThreshold   float64 `json:"extend"`
+	BranchThreshold   float64 `json:"branch"`
+	BubbleUpTerms     int     `json:"bubbleUpTerms"`
+	MaxSourcesPerNode int     `json:"maxSourcesPerNode"`
+	MemorySize        int     `json:"memorySize"`
+	DecayRate         float64 `json:"decayRate"`
+	ContextLimit      int     `json:"contextLimit"`
+	TransitionBoost   float64 `json:"transitionBoost"`
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ExtendThreshold:  0.55,
-		BranchThreshold:  0.25,
-		BubbleUpTerms:    6,
+		ExtendThreshold:   0.55,
+		BranchThreshold:   0.25,
+		BubbleUpTerms:     6,
 		MaxSourcesPerNode: 20,
-		MemorySize:       100,
-		DecayRate:        0.05,
-		ContextLimit:     600,
+		MemorySize:        100,
+		DecayRate:         0.05,
+		ContextLimit:      600,
+		TransitionBoost:   0.2,
 	}
 }
 
@@ -68,12 +71,18 @@ type Classification struct {
 type Gate struct {
 	Forest *forest.Forest
 	Engine *tfidf.Engine
+	Chain  *markov.Chain
 	Config Config
 }
 
 // New creates a Gate from existing forest and engine state.
 func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
-	return &Gate{Forest: f, Engine: e, Config: cfg}
+	return &Gate{Forest: f, Engine: e, Chain: markov.New(), Config: cfg}
+}
+
+// NewWithChain creates a Gate with an existing Markov chain.
+func NewWithChain(f *forest.Forest, e *tfidf.Engine, c *markov.Chain, cfg Config) *Gate {
+	return &Gate{Forest: f, Engine: e, Chain: c, Config: cfg}
 }
 
 // ProcessPrompt classifies a prompt, applies it to the forest, and returns context.
@@ -88,17 +97,51 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	cls := g.classify(vec)
 	g.apply(cls, prompt, source, tokens)
 
+	// Determine the tree ID that this prompt was classified into
+	currentTreeID := ""
+	if len(g.Forest.Trees) > 0 {
+		if cls.Action == ActionNew {
+			// New tree was just appended
+			currentTreeID = g.Forest.Trees[len(g.Forest.Trees)-1].ID
+		} else {
+			currentTreeID = g.Forest.Trees[cls.TreeIdx].ID
+		}
+	}
+
+	// Record Markov transition
+	g.Chain.Record(g.Chain.LastTopic, currentTreeID)
+	g.Chain.LastTopic = currentTreeID
+
 	g.Forest.Meta.TotalPrompts++
 	g.Forest.Meta.LastUpdate = g.Forest.Trees[len(g.Forest.Trees)-1].LastAccessed
 
 	// Add the new prompt to the TF-IDF corpus
 	g.Engine.AddDocument(tokens)
 
-	// Prune if needed
+	// Prune if needed — track which trees existed before pruning
 	if g.Forest.NodeCount() > g.Config.MemorySize {
+		treeIDs := make(map[string]bool, len(g.Forest.Trees))
+		for _, t := range g.Forest.Trees {
+			treeIDs[t.ID] = true
+		}
+
 		removed := g.Forest.Prune(g.Config.MemorySize, g.Config.DecayRate)
 		for _, content := range removed {
 			g.Engine.RemoveDocument(text.Tokenize(content))
+		}
+
+		// Sync Markov chain: prune topics for trees that were removed
+		for id := range treeIDs {
+			found := false
+			for _, t := range g.Forest.Trees {
+				if t.ID == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				g.Chain.PruneTopic(id)
+			}
 		}
 	}
 
@@ -106,12 +149,14 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 }
 
 // classify compares the prompt vector against all roots and leaves.
+// Adds a Markov transition boost per tree when transition data exists.
 func (g *Gate) classify(vec tfidf.Vector) Classification {
 	if len(g.Forest.Trees) == 0 || vec == nil {
 		return Classification{Action: ActionNew, Score: 0}
 	}
 
 	best := Classification{Action: ActionNew, Score: 0}
+	alpha := g.Config.TransitionBoost
 
 	for i, tree := range g.Forest.Trees {
 		root := tree.Root()
@@ -119,9 +164,15 @@ func (g *Gate) classify(vec tfidf.Vector) Classification {
 			continue
 		}
 
+		// Markov boost: P(this_tree | last_topic)
+		boost := 0.0
+		if alpha > 0 && g.Chain.LastTopic != "" {
+			boost = alpha * g.Chain.Probability(g.Chain.LastTopic, tree.ID)
+		}
+
 		// Compare against root
 		rootVec := g.Engine.Vectorize(root.Content)
-		rootSim := tfidf.CosineSimilarity(vec, rootVec)
+		rootSim := tfidf.CosineSimilarity(vec, rootVec) + boost
 		if rootSim > best.Score {
 			best.Score = rootSim
 			best.TreeIdx = i
@@ -131,7 +182,7 @@ func (g *Gate) classify(vec tfidf.Vector) Classification {
 		// Compare against each leaf
 		for _, leaf := range tree.GetLeaves() {
 			leafVec := g.Engine.Vectorize(leaf.Content)
-			leafSim := tfidf.CosineSimilarity(vec, leafVec)
+			leafSim := tfidf.CosineSimilarity(vec, leafVec) + boost
 			if leafSim > best.Score {
 				best.Score = leafSim
 				best.TreeIdx = i
@@ -276,15 +327,22 @@ func (g *Gate) GenerateContext() string {
 		g.Config.MemorySize,
 		len(g.Forest.Trees))
 
-	// Sort trees by root score descending
+	// Sort trees by root score descending, with Markov transition boost
 	type scoredTree struct {
 		tree  *forest.Tree
 		score float64
 	}
 	scored := make([]scoredTree, len(g.Forest.Trees))
 	now := g.Forest.Trees[0].LastAccessed
+	alpha := g.Config.TransitionBoost
 	for i, t := range g.Forest.Trees {
-		scored[i] = scoredTree{t, t.Root().Score(now, g.Config.DecayRate)}
+		decayScore := t.Root().Score(now, g.Config.DecayRate)
+		// Boost by transition probability from current topic
+		if alpha > 0 && g.Chain.LastTopic != "" {
+			tp := g.Chain.Probability(g.Chain.LastTopic, t.ID)
+			decayScore *= (1 + alpha*tp)
+		}
+		scored[i] = scoredTree{t, decayScore}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
@@ -317,6 +375,35 @@ func (g *Gate) GenerateContext() string {
 				content = content[:80] + "..."
 			}
 			fmt.Fprintf(&b, "    - %s\n", content)
+		}
+	}
+
+	// Prediction line: show likely next topics if transition data exists
+	if g.Chain.LastTopic != "" {
+		top := g.Chain.TopTransitions(g.Chain.LastTopic, 3)
+		if len(top) > 0 && top[0].Probability >= 0.3 {
+			b.WriteString("  -> next:")
+			for i, t := range top {
+				// Find tree name for this topic ID
+				name := t.TopicID[:8] // fallback: truncated ID
+				for _, tree := range g.Forest.Trees {
+					if tree.ID == t.TopicID {
+						root := tree.Root()
+						if root != nil {
+							name = root.Content
+							if len(name) > 30 {
+								name = name[:30]
+							}
+						}
+						break
+					}
+				}
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, " %s (%.0f%%)", name, t.Probability*100)
+			}
+			b.WriteString("\n")
 		}
 	}
 

@@ -11,6 +11,7 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
+	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
@@ -22,6 +23,7 @@ type paths struct {
 	intentFile string
 	engineFile string
 	guideFile  string
+	markovFile string
 	configFile string
 }
 
@@ -37,6 +39,7 @@ func resolvePaths() paths {
 		intentFile: filepath.Join(dataDir, "intent.json"),
 		engineFile: filepath.Join(dataDir, "engine.json"),
 		guideFile:  filepath.Join(dataDir, "guide.json"),
+		markovFile: filepath.Join(dataDir, "markov.json"),
 		configFile: filepath.Join(dir, "config.json"),
 	}
 }
@@ -49,10 +52,11 @@ type config struct {
 		Extend float64 `json:"extend"`
 		Branch float64 `json:"branch"`
 	} `json:"similarity"`
-	ContextLimit      int `json:"contextLimit"`
-	BubbleUpTerms     int `json:"bubbleUpTerms"`
-	MaxSourcesPerNode int `json:"maxSourcesPerNode"`
-	GuideSize         int `json:"guideSize"`
+	ContextLimit      int     `json:"contextLimit"`
+	BubbleUpTerms     int     `json:"bubbleUpTerms"`
+	MaxSourcesPerNode int     `json:"maxSourcesPerNode"`
+	GuideSize         int     `json:"guideSize"`
+	TransitionBoost   float64 `json:"transitionBoost"`
 }
 
 func defaultConfig() config {
@@ -63,6 +67,7 @@ func defaultConfig() config {
 		BubbleUpTerms:     6,
 		MaxSourcesPerNode: 20,
 		GuideSize:         15,
+		TransitionBoost:   0.2,
 	}
 	c.Similarity.Extend = 0.55
 	c.Similarity.Branch = 0.25
@@ -97,6 +102,9 @@ func loadConfig(path string) config {
 	}
 	if cfg.GuideSize == 0 {
 		cfg.GuideSize = d.GuideSize
+	}
+	if cfg.TransitionBoost == 0 {
+		cfg.TransitionBoost = d.TransitionBoost
 	}
 	return cfg
 }
@@ -143,6 +151,7 @@ func handleReset(p paths) error {
 	persist.Remove(p.intentFile)
 	persist.Remove(p.engineFile)
 	persist.Remove(p.guideFile)
+	persist.Remove(p.markovFile)
 	fmt.Fprint(os.Stdout, "[Focus] Reset complete. All tracking data cleared.\n")
 	return nil
 }
@@ -157,8 +166,11 @@ func handleStatus(p paths, cfg config) error {
 	g := guide.New(cfg.GuideSize)
 	_ = persist.Load(p.guideFile, g)
 
+	c := markov.New()
+	_ = persist.Load(p.markovFile, c)
+
 	gateCfg := toGateConfig(cfg)
-	gt := gate.New(f, e, gateCfg)
+	gt := gate.NewWithChain(f, e, c, gateCfg)
 	ctx := gt.GenerateContext()
 	if ctx != "" {
 		fmt.Fprint(os.Stdout, ctx)
@@ -205,6 +217,9 @@ func handlePrompt(p paths, cfg config) error {
 	g := guide.New(cfg.GuideSize)
 	_ = persist.Load(p.guideFile, g)
 
+	c := markov.New()
+	_ = persist.Load(p.markovFile, c)
+
 	// Update guide from transcript (if available)
 	if input.TranscriptPath != "" {
 		updateGuide(g, input.TranscriptPath, f)
@@ -212,11 +227,10 @@ func handlePrompt(p paths, cfg config) error {
 
 	// Process prompt
 	gateCfg := toGateConfig(cfg)
-	gt := gate.New(f, e, gateCfg)
-	ctx := gt.GenerateContext()
+	gt := gate.NewWithChain(f, e, c, gateCfg)
 
 	// Process the new prompt
-	ctx = gt.ProcessPrompt(prompt, fmt.Sprintf("p%d", f.Meta.TotalPrompts))
+	ctx := gt.ProcessPrompt(prompt, fmt.Sprintf("p%d", f.Meta.TotalPrompts))
 
 	// Append guide context
 	guideCtx := g.Render(f)
@@ -234,6 +248,9 @@ func handlePrompt(p paths, cfg config) error {
 	}
 	if err := persist.SaveAtomic(p.guideFile, g); err != nil {
 		fmt.Fprintf(os.Stderr, "focus-gate: save guide: %v\n", err)
+	}
+	if err := persist.SaveAtomic(p.markovFile, c); err != nil {
+		fmt.Fprintf(os.Stderr, "focus-gate: save markov: %v\n", err)
 	}
 
 	// Output context to stdout
@@ -310,5 +327,6 @@ func toGateConfig(cfg config) gate.Config {
 		MemorySize:        cfg.MemorySize,
 		DecayRate:         cfg.DecayRate,
 		ContextLimit:      cfg.ContextLimit,
+		TransitionBoost:   cfg.TransitionBoost,
 	}
 }

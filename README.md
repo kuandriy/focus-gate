@@ -58,6 +58,8 @@ Your prompts are organized into a **forest** of topic trees. Each new prompt is 
 | 0.25 - 0.55 | Branch | Broadly related to a topic theme |
 | < 0.25 | New Tree | Unrelated — starts a new topic |
 
+A **Markov chain** tracks topic-to-topic transitions. When you repeatedly switch between topics in a pattern (e.g. auth -> database -> frontend), the chain learns this and boosts the likely next topic during classification. A prediction line appears in the context output when confidence exceeds 30%.
+
 The forest self-cleans: nodes decay over time, and when memory fills up, the least relevant topics are pruned automatically.
 
 ## Configuration
@@ -70,7 +72,8 @@ Create a `config.json` alongside the binary:
   "decayRate": 0.05,
   "similarity": { "extend": 0.55, "branch": 0.25 },
   "contextLimit": 600,
-  "bubbleUpTerms": 6
+  "bubbleUpTerms": 6,
+  "transitionBoost": 0.2
 }
 ```
 
@@ -83,6 +86,7 @@ internal/
   tfidf/            TF-IDF engine, sparse vectors, cosine similarity
   forest/           Node, Tree, Forest, heap-based pruning
   gate/             FocusGate classifier (classify, apply, bubble-up)
+  markov/           Topic transition chain (prediction, boost)
   guide/            AI response tracking (ring buffer)
   persist/          Atomic JSON persistence
 ```
