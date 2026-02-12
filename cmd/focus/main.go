@@ -46,9 +46,9 @@ func resolvePaths() paths {
 
 // config matches the JSON config file structure.
 type config struct {
-	MemorySize        int     `json:"memorySize"`
-	DecayRate         float64 `json:"decayRate"`
-	Similarity        struct {
+	MemorySize int     `json:"memorySize"`
+	DecayRate  float64 `json:"decayRate"`
+	Similarity struct {
 		Extend float64 `json:"extend"`
 		Branch float64 `json:"branch"`
 	} `json:"similarity"`
@@ -74,38 +74,66 @@ func defaultConfig() config {
 	return c
 }
 
+// loadConfig uses a two-phase JSON approach to distinguish "user set field to 0"
+// from "field absent" (should use default). Phase 1 loads a raw map to detect
+// which keys are present. Phase 2 loads the full struct. Only explicitly present
+// keys override defaults, so users can intentionally set transitionBoost=0 or
+// decayRate=0 without the value being silently replaced.
 func loadConfig(path string) config {
 	cfg := defaultConfig()
-	_ = persist.Load(path, &cfg)
-	// Apply defaults for any zero values
-	d := defaultConfig()
-	if cfg.MemorySize == 0 {
-		cfg.MemorySize = d.MemorySize
+
+	// Phase 1: Detect which keys the user explicitly set.
+	raw := make(map[string]json.RawMessage)
+	if err := persist.Load(path, &raw); err != nil {
+		fmt.Fprintf(os.Stderr, "focus-gate: load config: %v\n", err)
+		return cfg
 	}
-	if cfg.DecayRate == 0 {
-		cfg.DecayRate = d.DecayRate
+	if len(raw) == 0 {
+		return cfg
 	}
-	if cfg.Similarity.Extend == 0 {
-		cfg.Similarity.Extend = d.Similarity.Extend
+
+	// Phase 2: Parse into full struct.
+	var userCfg config
+	if err := persist.Load(path, &userCfg); err != nil {
+		fmt.Fprintf(os.Stderr, "focus-gate: parse config: %v\n", err)
+		return cfg
 	}
-	if cfg.Similarity.Branch == 0 {
-		cfg.Similarity.Branch = d.Similarity.Branch
+
+	// Phase 3: Apply only the keys the user explicitly wrote.
+	if _, ok := raw["memorySize"]; ok {
+		cfg.MemorySize = userCfg.MemorySize
 	}
-	if cfg.ContextLimit == 0 {
-		cfg.ContextLimit = d.ContextLimit
+	if _, ok := raw["decayRate"]; ok {
+		cfg.DecayRate = userCfg.DecayRate
 	}
-	if cfg.BubbleUpTerms == 0 {
-		cfg.BubbleUpTerms = d.BubbleUpTerms
+	if _, ok := raw["contextLimit"]; ok {
+		cfg.ContextLimit = userCfg.ContextLimit
 	}
-	if cfg.MaxSourcesPerNode == 0 {
-		cfg.MaxSourcesPerNode = d.MaxSourcesPerNode
+	if _, ok := raw["bubbleUpTerms"]; ok {
+		cfg.BubbleUpTerms = userCfg.BubbleUpTerms
 	}
-	if cfg.GuideSize == 0 {
-		cfg.GuideSize = d.GuideSize
+	if _, ok := raw["maxSourcesPerNode"]; ok {
+		cfg.MaxSourcesPerNode = userCfg.MaxSourcesPerNode
 	}
-	if cfg.TransitionBoost == 0 {
-		cfg.TransitionBoost = d.TransitionBoost
+	if _, ok := raw["guideSize"]; ok {
+		cfg.GuideSize = userCfg.GuideSize
 	}
+	if _, ok := raw["transitionBoost"]; ok {
+		cfg.TransitionBoost = userCfg.TransitionBoost
+	}
+	// Handle nested "similarity" object.
+	if simRaw, ok := raw["similarity"]; ok {
+		var simMap map[string]json.RawMessage
+		if json.Unmarshal(simRaw, &simMap) == nil {
+			if _, ok := simMap["extend"]; ok {
+				cfg.Similarity.Extend = userCfg.Similarity.Extend
+			}
+			if _, ok := simMap["branch"]; ok {
+				cfg.Similarity.Branch = userCfg.Similarity.Branch
+			}
+		}
+	}
+
 	return cfg
 }
 
@@ -131,6 +159,9 @@ func main() {
 
 func run() error {
 	p := resolvePaths()
+
+	// Recover .tmp files from interrupted saves before loading any state.
+	persist.RecoverTmpFiles(p.intentFile, p.engineFile, p.guideFile, p.markovFile)
 	cfg := loadConfig(p.configFile)
 
 	// Parse CLI flags
@@ -156,18 +187,28 @@ func handleReset(p paths) error {
 	return nil
 }
 
+// logLoadErr logs non-nil persist.Load errors to stderr. Errors are logged
+// rather than returned because a corrupt file should not block the user's
+// prompt — the system continues with empty/default state and the user can
+// --reset if needed.
+func logLoadErr(name string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "focus-gate: load %s: %v\n", name, err)
+	}
+}
+
 func handleStatus(p paths, cfg config) error {
 	f := forest.NewForest()
-	_ = persist.Load(p.intentFile, f)
+	logLoadErr("intent", persist.Load(p.intentFile, f))
 
 	e := tfidf.NewEngine()
-	_ = persist.Load(p.engineFile, e)
+	logLoadErr("engine", persist.Load(p.engineFile, e))
 
 	g := guide.New(cfg.GuideSize)
-	_ = persist.Load(p.guideFile, g)
+	logLoadErr("guide", persist.Load(p.guideFile, g))
 
 	c := markov.New()
-	_ = persist.Load(p.markovFile, c)
+	logLoadErr("markov", persist.Load(p.markovFile, c))
 
 	gateCfg := toGateConfig(cfg)
 	gt := gate.NewWithChain(f, e, c, gateCfg)
@@ -209,16 +250,16 @@ func handlePrompt(p paths, cfg config) error {
 
 	// Load persisted state
 	f := forest.NewForest()
-	_ = persist.Load(p.intentFile, f)
+	logLoadErr("intent", persist.Load(p.intentFile, f))
 
 	e := tfidf.NewEngine()
-	_ = persist.Load(p.engineFile, e)
+	logLoadErr("engine", persist.Load(p.engineFile, e))
 
 	g := guide.New(cfg.GuideSize)
-	_ = persist.Load(p.guideFile, g)
+	logLoadErr("guide", persist.Load(p.guideFile, g))
 
 	c := markov.New()
-	_ = persist.Load(p.markovFile, c)
+	logLoadErr("markov", persist.Load(p.markovFile, c))
 
 	// Update guide from transcript (if available)
 	if input.TranscriptPath != "" {
@@ -228,6 +269,12 @@ func handlePrompt(p paths, cfg config) error {
 	// Process prompt
 	gateCfg := toGateConfig(cfg)
 	gt := gate.NewWithChain(f, e, c, gateCfg)
+
+	// Reinforce the forest from new AI response summaries before classifying
+	// the incoming prompt, so tree scores reflect recent assistant activity.
+	if reinforced := gt.ReinforceFromGuide(g); reinforced > 0 {
+		fmt.Fprintf(os.Stderr, "focus-gate: reinforced %d guide entries\n", reinforced)
+	}
 
 	// Process the new prompt
 	ctx := gt.ProcessPrompt(prompt, fmt.Sprintf("p%d", f.Meta.TotalPrompts))
@@ -258,45 +305,68 @@ func handlePrompt(p paths, cfg config) error {
 	return nil
 }
 
-// updateGuide reads the last assistant response from the transcript and adds it to the guide.
+// updateGuide extracts the last assistant message from a Claude Code transcript
+// and adds it to the guide. Uses structured JSON decoding to handle all valid
+// transcript formats — plain string content, arrays of content blocks, nested
+// objects, and escaped characters.
 func updateGuide(g *guide.Guide, transcriptPath string, f *forest.Forest) {
 	data, err := os.ReadFile(transcriptPath)
 	if err != nil {
 		return
 	}
 
-	// Find last assistant message in the transcript
-	content := string(data)
-	idx := strings.LastIndex(content, `"role":"assistant"`)
-	if idx < 0 {
-		idx = strings.LastIndex(content, `"role": "assistant"`)
+	// Claude Code transcript: JSON array of {role, message: {content}} objects.
+	// content may be a plain string or an array of {type, text} blocks.
+	type transcriptEntry struct {
+		Role    string `json:"role"`
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
-	if idx < 0 {
+
+	var transcript []transcriptEntry
+	if err := json.Unmarshal(data, &transcript); err != nil {
 		return
 	}
 
-	// Extract a summary (first ~200 chars of the response content)
-	contentStart := strings.Index(content[idx:], `"content"`)
-	if contentStart < 0 {
-		return
-	}
-	snippet := content[idx+contentStart:]
-	// Find the text value
-	valStart := strings.Index(snippet, `":"`)
-	if valStart < 0 {
-		valStart = strings.Index(snippet, `": "`)
-		if valStart < 0 {
-			return
+	// Walk backwards to find the last assistant message.
+	snippet := ""
+	for i := len(transcript) - 1; i >= 0; i-- {
+		if transcript[i].Role != "assistant" {
+			continue
 		}
-		valStart += 4
-	} else {
-		valStart += 3
+
+		raw := transcript[i].Message.Content
+		if len(raw) == 0 {
+			continue
+		}
+
+		// Try content as plain string first, then as array of content blocks.
+		var contentStr string
+		if json.Unmarshal(raw, &contentStr) == nil && contentStr != "" {
+			snippet = contentStr
+			break
+		}
+
+		// Array of content blocks (Claude format): [{type, text}, ...].
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(raw, &blocks) == nil {
+			for _, block := range blocks {
+				if block.Text != "" {
+					snippet = block.Text
+					break
+				}
+			}
+			if snippet != "" {
+				break
+			}
+		}
 	}
-	snippet = snippet[valStart:]
-	// Take up to 200 chars, stop at quote
-	if endQuote := strings.Index(snippet, `"`); endQuote > 0 {
-		snippet = snippet[:endQuote]
-	}
+
+	// Truncate to a summary length.
 	if len(snippet) > 200 {
 		snippet = snippet[:200] + "..."
 	}
@@ -305,7 +375,7 @@ func updateGuide(g *guide.Guide, transcriptPath string, f *forest.Forest) {
 		return
 	}
 
-	// Find the closest intent node to link to
+	// Link to the most recent leaf in the last tree.
 	intentID := ""
 	if len(f.Trees) > 0 {
 		lastTree := f.Trees[len(f.Trees)-1]

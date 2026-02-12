@@ -216,11 +216,14 @@ func TestMarkovTiebreaker(t *testing.T) {
 
 	// Both trees have "server" and "endpoint" — cosine similarity should be similar
 	// But tree2 should win due to Markov boost
+
+	// Verify the Markov tiebreaker actually changes the classification outcome.
+	// Both trees share "server" and "endpoint" for near-equal cosine similarity,
+	// but the recorded tree1→tree2 transitions should tip the result to tree2.
 	cls := g.classify(e.Vectorize("server endpoint"))
 	if cls.TreeIdx != 1 {
-		t.Logf("Classification: TreeIdx=%d, Score=%.3f, Action=%s", cls.TreeIdx, cls.Score, cls.Action)
-		// Not a hard failure — cosine similarity might differ enough to override
-		// But the boost should be visible
+		t.Errorf("Markov tiebreaker failed: TreeIdx=%d, Score=%.3f, Action=%s (expected TreeIdx=1 due to Markov boost from tree1→tree2)",
+			cls.TreeIdx, cls.Score, cls.Action)
 	}
 }
 

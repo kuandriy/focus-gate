@@ -14,10 +14,23 @@ type Entry struct {
 	IntentID  string   `json:"intentId"`
 	Refs      []string `json:"refs,omitempty"`
 	Timestamp int64    `json:"timestamp"`
+
+	// Reinforced is set after this entry has been used by Gate.ReinforceFromGuide
+	// to Touch the matching tree root. Prevents double-reinforcement across restarts.
+	Reinforced bool `json:"reinforced,omitempty"`
 }
 
-// Guide tracks AI responses as a simple ring buffer with intent links.
-// Much simpler than a full second forest — O(1) add, O(n) render.
+// Guide is a ring buffer of AI response summaries linked to intent nodes.
+//
+// It serves two roles in the feedback loop:
+//  1. Context output — Render() formats recent summaries for the AI's next prompt.
+//  2. Bidirectional reinforcement — unreinforced entries are processed by
+//     Gate.ReinforceFromGuide(), which matches each summary against the forest
+//     and touches the closest tree root. This way both user prompts and AI
+//     responses contribute to topic weight, keeping actively-discussed trees
+//     alive longer.
+//
+// Entries are capped at MaxSize. Oldest entries are evicted on overflow.
 type Guide struct {
 	Entries []Entry `json:"entries"`
 	MaxSize int     `json:"maxSize"`
@@ -44,6 +57,19 @@ func (g *Guide) Add(summary string, intentID string, refs []string) {
 	if len(g.Entries) > g.MaxSize {
 		g.Entries = g.Entries[len(g.Entries)-g.MaxSize:]
 	}
+}
+
+// UnreinforcedEntries returns pointers to entries not yet processed for
+// forest reinforcement. Gate.ReinforceFromGuide uses this to avoid
+// double-touching trees on repeated loads.
+func (g *Guide) UnreinforcedEntries() []*Entry {
+	var entries []*Entry
+	for i := range g.Entries {
+		if !g.Entries[i].Reinforced {
+			entries = append(entries, &g.Entries[i])
+		}
+	}
+	return entries
 }
 
 // Render formats guide entries whose intentID still exists in the forest.

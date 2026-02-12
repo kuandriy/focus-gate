@@ -20,6 +20,13 @@ type Node struct {
 	Sources      []string `json:"sources"`
 	ChildIDs     []string `json:"childIds"`
 	ParentID     string   `json:"parentId,omitempty"`
+
+	// Indexed indicates this node's content is registered in the TF-IDF engine.
+	// Only nodes holding real user prompt text are indexed. Synthetic abstractions
+	// produced by bubbleUp are not. Prune uses this flag to decide whether to call
+	// RemoveDocument — calling it on non-indexed content would decrement document
+	// frequencies for terms that were never added, corrupting IDF over time.
+	Indexed bool `json:"indexed,omitempty"`
 }
 
 // NewNode creates a node with a unique ID and initial values.

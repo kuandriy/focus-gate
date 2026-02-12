@@ -157,10 +157,13 @@ func TestForestPrune(t *testing.T) {
 	f := NewForest()
 	tree := NewTree("root", "")
 	root := tree.Root()
+	// Mark nodes as indexed so Prune includes their content in the removed list.
+	root.Indexed = true
 
 	// Add 5 children, pushing total to 6 nodes
 	for i := 0; i < 5; i++ {
-		tree.AddChild(root.ID, "child", "")
+		child := tree.AddChild(root.ID, "child", "")
+		child.Indexed = true
 	}
 	f.AddTree(tree)
 

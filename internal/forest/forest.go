@@ -39,7 +39,8 @@ func (f *Forest) NodeCount() int {
 }
 
 // AllLeaves returns all leaf nodes across all trees with their tree index.
-func (f *Forest) AllLeaves() []LeafEntry {
+// decayRate controls the exponential time-decay applied to each node's score.
+func (f *Forest) AllLeaves(decayRate float64) []LeafEntry {
 	var entries []LeafEntry
 	now := time.Now().UnixMilli()
 	for i, t := range f.Trees {
@@ -51,16 +52,18 @@ func (f *Forest) AllLeaves() []LeafEntry {
 			entries = append(entries, LeafEntry{
 				Node:    n,
 				TreeIdx: i,
-				Score:   n.Score(now, 0.05), // default decay; overridden in Prune
+				Score:   n.Score(now, decayRate),
 			})
 		}
 	}
 	return entries
 }
 
-// Prune removes the lowest-scoring leaves until the forest is within the memory limit.
-// Uses a min-heap for O(log n) extraction per prune step.
-// Returns the content of each removed node (for IDF decremental updates).
+// Prune removes the lowest-scoring leaves until the forest fits within memorySize.
+// Uses a min-heap for O(log n) extraction per step. Returns the content of pruned
+// nodes that were indexed in the TF-IDF engine, so the caller can RemoveDocument
+// them. Non-indexed nodes (synthetic bubble-up abstractions) are excluded from
+// the returned list to prevent document-frequency drift.
 func (f *Forest) Prune(memorySize int, decayRate float64) []string {
 	var removedContents []string
 
@@ -96,8 +99,11 @@ func (f *Forest) Prune(memorySize int, decayRate float64) []string {
 					worstIdx = i
 				}
 			}
+			// Only return content from indexed nodes for TF-IDF cleanup.
 			for _, n := range f.Trees[worstIdx].Nodes {
-				removedContents = append(removedContents, n.Content)
+				if n.Indexed {
+					removedContents = append(removedContents, n.Content)
+				}
 			}
 			f.Trees = append(f.Trees[:worstIdx], f.Trees[worstIdx+1:]...)
 			continue
@@ -106,13 +112,17 @@ func (f *Forest) Prune(memorySize int, decayRate float64) []string {
 		// Pop the lowest-scoring leaf
 		entry := heap.Pop(h).(LeafEntry)
 		tree := f.Trees[entry.TreeIdx]
-		removedContents = append(removedContents, entry.Node.Content)
+		if entry.Node.Indexed {
+			removedContents = append(removedContents, entry.Node.Content)
+		}
 		tree.RemoveNode(entry.Node.ID)
 
 		// If the tree has only the root left (or is empty), remove the tree
 		if tree.NodeCount() <= 1 {
 			for _, n := range tree.Nodes {
-				removedContents = append(removedContents, n.Content)
+				if n.Indexed {
+					removedContents = append(removedContents, n.Content)
+				}
 			}
 			f.Trees = append(f.Trees[:entry.TreeIdx], f.Trees[entry.TreeIdx+1:]...)
 		}
