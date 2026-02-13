@@ -96,10 +96,12 @@ Each new prompt is classified by **TF-IDF cosine similarity**:
 A **Markov chain** tracks topic-to-topic transitions. When you repeatedly switch between topics in a pattern (e.g. auth -> database -> frontend), the chain learns this and boosts the likely next topic during classification:
 
 ```
-score = cosine_similarity + alpha * P(tree | last_topic)
+score = cosine_similarity * (1 + alpha * P(tree | last_topic))
 ```
 
-Where `alpha` defaults to 0.2. A prediction line appears in the context output when the top transition probability exceeds 30%:
+The multiplicative form ensures that a zero-similarity prompt cannot match a tree through transition history alone — Markov only amplifies existing content similarity, acting as a tiebreaker between genuinely related trees.
+
+`alpha` defaults to 0.2. A prediction line appears in the context output when the top transition probability exceeds 30%:
 
 ```
   -> next: database migration (78%)
@@ -114,6 +116,8 @@ The forest has a configurable memory limit (default: 100 nodes). When it fills u
 - **Depth**: Deeper nodes are slightly less valuable than shallow ones
 
 Topics you keep revisiting stay. Topics you mentioned once hours ago fade away.
+
+Nodes carry an **indexed** flag that tracks whether their content was registered with the TF-IDF engine. Only real user-prompt nodes are indexed; synthetic bubble-up abstractions are not. During pruning, only indexed content triggers `RemoveDocument`, preventing document-frequency counters from drifting over long sessions.
 
 ---
 
@@ -159,9 +163,27 @@ Add to `.claude/settings.local.json`:
 # Reset all tracking data
 ./focus-gate --reset
 
+# Inspect full internal state (forest, TF-IDF, guide, Markov)
+./focus-gate --inspect
+
+# Inspect with JSON output for programmatic analysis
+./focus-gate --inspect --json
+
+# Dry-run: classify a prompt without modifying any state
+./focus-gate --dry-run "your prompt text here"
+
+# Dry-run with JSON output
+./focus-gate --dry-run "your prompt text" --json
+
 # Process a prompt (hook mode, reads JSON from stdin)
 echo '{"prompt":"your prompt text"}' | ./focus-gate
 ```
+
+#### Observability
+
+**`--inspect`** dumps the complete internal state in a single view: all forest trees with their full node hierarchy (IDs, depth, weight, frequency, indexed flag, decay score), TF-IDF corpus statistics (total documents, top terms by document frequency), guide entries with reinforcement state, and the Markov transition matrix with probabilities. Add `--json` for machine-readable output.
+
+**`--dry-run "prompt"`** runs the full classification pipeline — tokenization, TF-IDF vectorization, cosine similarity against every root and leaf, multiplicative Markov boost — and shows exactly what would happen, without mutating any state. The output includes per-tree scoring breakdown and the predicted action (new / branch / extend). Useful for verifying threshold tuning and understanding classification decisions.
 
 ### Context Output
 
@@ -183,6 +205,12 @@ Guide:
 ```
 
 Trees are sorted by score (highest first), limited to 5. Each tree shows up to 3 recent leaves. The entire output is capped at `contextLimit` characters (default 600).
+
+### Bidirectional Guide Reinforcement
+
+The Guide doesn't just display past AI responses — it feeds them back into the forest. Before each prompt is classified, unreinforced guide entries are tokenized, vectorized, and matched against tree roots by cosine similarity. The best-matching root is **touched** (weight and recency increase), making actively-discussed trees stickier and harder to prune.
+
+This means both user prompts and AI responses shape the intent forest. When you ask about "authentication" and the AI responds about "JWT token rotation," that response reinforces the authentication tree. Each entry is marked as reinforced after processing, so it is never double-counted.
 
 ---
 
@@ -211,8 +239,10 @@ Uses a two-level comparison:
 
 1. Compare prompt vector against each tree's **root** (catches broad thematic matches)
 2. Compare against each tree's **leaves** (catches precise matches)
-3. Add Markov transition boost per tree
+3. Multiply by Markov transition boost per tree
 4. Best score determines action (extend / branch / new)
+
+Node vectors are **cached** after first computation and invalidated when content changes (bubble-up) or when a new document shifts IDF weights. This avoids re-tokenizing and re-vectorizing every node on every prompt.
 
 ### Stemmer
 
@@ -265,6 +295,8 @@ Create a `config.json` alongside the binary:
 }
 ```
 
+Only fields present in the file override defaults. A field explicitly set to `0` (e.g. `"transitionBoost": 0` to disable Markov boost) is respected — it will not be replaced with the default.
+
 | Parameter | Default | Description |
 |:---|:---:|:---|
 | `memorySize` | 100 | Maximum total nodes across all trees |
@@ -289,24 +321,26 @@ Create a `config.json` alongside the binary:
 ## Architecture
 
 ```
-cmd/focus/          Entry point (CLI, stdin/stdout)
+cmd/focus/          Entry point (CLI, stdin/stdout, inspect/dry-run)
 internal/
   text/             Tokenizer, stemmer, stop words
   tfidf/            TF-IDF engine, sparse vectors, cosine similarity
   forest/           Node, Tree, Forest, heap-based pruning
-  gate/             Focus Gate classifier (classify, apply, bubble-up)
+  gate/             Focus Gate classifier (classify, apply, bubble-up, dry-run)
   markov/           Topic transition chain (prediction, boost)
-  guide/            AI response tracking (ring buffer)
-  persist/          Atomic JSON persistence
+  guide/            AI response tracking (ring buffer + forest reinforcement)
+  persist/          Atomic JSON persistence (Windows-safe, .tmp recovery)
 ```
 
-Data is persisted as JSON in a `data/` directory alongside the binary:
+Data is persisted as JSON in a `data/` directory alongside the binary. Writes use **atomic save** (write to `.tmp`, then rename). On Windows, where `os.Rename` is not atomic, the target is removed before rename; a **recovery pass** on startup promotes any orphaned `.tmp` files left by interrupted saves.
+
+All `persist.Load` errors are logged to stderr rather than silently discarded — a corrupt file does not block the user's prompt; the system continues with empty state and the user can `--reset` if needed.
 
 | File | Purpose |
 |:---|:---|
 | `data/intent.json` | Intent forest — what the user is asking about |
 | `data/engine.json` | TF-IDF document frequency counts |
-| `data/guide.json` | AI response summaries with intent links |
+| `data/guide.json` | AI response summaries with intent links and reinforcement state |
 | `data/markov.json` | Topic transition probability matrix |
 
 ---

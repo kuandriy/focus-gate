@@ -164,13 +164,29 @@ func run() error {
 	persist.RecoverTmpFiles(p.intentFile, p.engineFile, p.guideFile, p.markovFile)
 	cfg := loadConfig(p.configFile)
 
-	// Parse CLI flags
+	// Parse CLI flags. --json is a modifier flag that can appear alongside
+	// --inspect or --dry-run to switch output from human-readable text to
+	// machine-readable JSON.
+	jsonOutput := hasFlag(os.Args, "--json")
+
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--reset":
 			return handleReset(p)
 		case "--status":
 			return handleStatus(p, cfg)
+		case "--inspect":
+			return handleInspect(p, cfg, jsonOutput)
+		case "--dry-run":
+			// --dry-run expects the next argument to be the prompt string.
+			prompt := ""
+			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "--") {
+				prompt = os.Args[2]
+			}
+			if prompt == "" {
+				return fmt.Errorf("usage: focus --dry-run \"prompt text\" [--json]")
+			}
+			return handleDryRun(p, cfg, prompt, jsonOutput)
 		}
 	}
 
