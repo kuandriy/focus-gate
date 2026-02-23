@@ -6,6 +6,13 @@ import (
 	"github.com/kuandriy/focus-gate/internal/text"
 )
 
+// MinVirtualDocs is the minimum effective corpus size used in the IDF
+// denominator. With fewer than this many real documents, IDF pretends the
+// corpus is this large so that term weights can discriminate even during
+// the first few prompts of a session. Once TotalDocs >= MinVirtualDocs,
+// this floor has no effect.
+const MinVirtualDocs = 5
+
 // Engine is an incremental TF-IDF engine. Unlike rebuilding the entire corpus
 // on every invocation, it persists document frequency counts and updates them
 // incrementally as documents are added or removed (during pruning).
@@ -54,14 +61,19 @@ func (e *Engine) RemoveDocument(tokens []string) {
 }
 
 // IDF computes the inverse document frequency for a term.
-// Uses smoothed formula: log2(1 + totalDocs/df).
-// Returns 0 for unknown terms.
+// Uses smoothed formula: log2(1 + effectiveDocs/df) where effectiveDocs
+// is max(TotalDocs, MinVirtualDocs) to ensure discrimination at low
+// document counts. Returns 0 for unknown terms.
 func (e *Engine) IDF(term string) float64 {
 	df := e.DocFreq[term]
 	if df == 0 {
 		return 0
 	}
-	return math.Log2(1 + float64(e.TotalDocs)/float64(df))
+	effectiveDocs := e.TotalDocs
+	if effectiveDocs < MinVirtualDocs {
+		effectiveDocs = MinVirtualDocs
+	}
+	return math.Log2(1 + float64(effectiveDocs)/float64(df))
 }
 
 // Vectorize converts raw text into a sorted TF-IDF Vector.

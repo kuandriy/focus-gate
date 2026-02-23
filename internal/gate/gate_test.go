@@ -302,11 +302,16 @@ func TestMarkovNoPredictionWhenWeak(t *testing.T) {
 	f.AddTree(tree3)
 	f.AddTree(tree4)
 
-	// Spread transitions evenly — no single target > 30% (each = 25%)
+	// Spread transitions evenly — no single target >= 30%
+	// With self-transitions skipped, we need enough distinct targets
 	c.Record(tree1.ID, tree2.ID)
 	c.Record(tree1.ID, tree3.ID)
 	c.Record(tree1.ID, tree4.ID)
-	c.Record(tree1.ID, tree1.ID) // self-transition
+	// Add a fifth target to dilute further
+	tree5 := forest.NewTree("monitoring", "p5")
+	f.AddTree(tree5)
+	c.Record(tree1.ID, tree5.ID)
+	// tree2=1, tree3=1, tree4=1, tree5=1 → each 25% (< 30%)
 	c.LastTopic = tree1.ID
 
 	f.Meta.TotalPrompts = 5

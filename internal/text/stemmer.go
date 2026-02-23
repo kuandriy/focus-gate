@@ -12,6 +12,23 @@ var derivational = []string{
 	"ful", "ous", "ive", "ing", "ed", "ly",
 }
 
+// stemOverrides prevents known false conflations where mechanical suffix
+// stripping produces an unrelated root word. For example, "authorization"
+// would stem to "author" (unrelated) and "organization" to "organ".
+var stemOverrides = map[string]string{
+	"organization":   "organiz",
+	"organizations":  "organiz",
+	"organize":       "organiz",
+	"organized":      "organiz",
+	"organizing":     "organiz",
+	"authorization":  "authoriz",
+	"authorizations": "authoriz",
+	"authorize":      "authoriz",
+	"authorized":     "authoriz",
+	"authorizing":    "authoriz",
+	"unauthorized":   "authoriz",
+}
+
 // Stem applies a lightweight two-pass suffix stemmer.
 //
 // Pass 1 strips plurals (s/es/ies).
@@ -21,6 +38,11 @@ var derivational = []string{
 func Stem(word string) string {
 	if len(word) < 4 {
 		return word
+	}
+
+	// Check override map before mechanical suffix stripping.
+	if override, ok := stemOverrides[word]; ok {
+		return override
 	}
 
 	// Pass 1: remove plurals

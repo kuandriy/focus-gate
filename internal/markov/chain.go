@@ -25,8 +25,11 @@ func New() *Chain {
 }
 
 // Record increments the transition count from → to.
+// Self-transitions (from == to) are skipped — they add no information about
+// topic switching patterns and would inflate P(A|A), creating redundant
+// stickiness on top of the existing recency/decay mechanism.
 func (c *Chain) Record(from, to string) {
-	if from == "" || to == "" {
+	if from == "" || to == "" || from == to {
 		return
 	}
 	if c.Counts[from] == nil {

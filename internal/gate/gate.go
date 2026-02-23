@@ -317,31 +317,46 @@ func (g *Gate) bubbleUp(tree *forest.Tree, nodeID string) {
 	// that was never added to the TF-IDF corpus.
 	node.Indexed = false
 
-	// Collect all children content, tokenize, count frequencies
-	freq := make(map[string]int)
+	// Collect per-child unique tokens and count how many children contain each
+	// term (presence count). This favors terms with cross-child breadth over
+	// terms concentrated in a single child.
+	presence := make(map[string]int)
 	for _, childID := range node.ChildIDs {
 		child := tree.Nodes[childID]
 		if child == nil {
 			continue
 		}
 		tokens := text.Tokenize(child.Content)
+		seen := make(map[string]bool, len(tokens))
 		for _, t := range tokens {
-			freq[t]++
+			if !seen[t] {
+				presence[t]++
+				seen[t] = true
+			}
 		}
 	}
 
-	// Extract top N terms by frequency
-	type termCount struct {
+	// Score each term by presence × IDF. This preserves the cross-child breadth
+	// signal (terms in more children score higher) while penalizing corpus-common
+	// terms like "add" or "fix" that survive stop-word filtering.
+	type termScore struct {
 		term  string
-		count int
+		score float64
 	}
-	sorted := make([]termCount, 0, len(freq))
-	for t, c := range freq {
-		sorted = append(sorted, termCount{t, c})
+	sorted := make([]termScore, 0, len(presence))
+	for t, count := range presence {
+		idf := g.Engine.IDF(t)
+		if idf == 0 {
+			// Term not in corpus yet — use presence count alone as fallback.
+			// This can happen when bubbleUp runs before AddDocument for
+			// the newest prompt's tokens.
+			idf = 1.0
+		}
+		sorted = append(sorted, termScore{t, float64(count) * idf})
 	}
 	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].count != sorted[j].count {
-			return sorted[i].count > sorted[j].count
+		if sorted[i].score != sorted[j].score {
+			return sorted[i].score > sorted[j].score
 		}
 		return sorted[i].term < sorted[j].term
 	})

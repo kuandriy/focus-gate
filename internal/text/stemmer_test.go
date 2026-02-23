@@ -57,6 +57,24 @@ func TestStem(t *testing.T) {
 
 		// Both passes: plurals then derivational
 		{"authentications", "authentica"}, // -s then -tion
+
+		// Stem overrides — prevent false conflation
+		{"authorization", "authoriz"},
+		{"authorizations", "authoriz"},
+		{"authorize", "authoriz"},
+		{"authorized", "authoriz"},
+		{"authorizing", "authoriz"},
+		{"unauthorized", "authoriz"},
+		{"organization", "organiz"},
+		{"organizations", "organiz"},
+		{"organize", "organiz"},
+		{"organized", "organiz"},
+		{"organizing", "organiz"},
+
+		// Non-overridden -ization words should still work
+		{"containerization", "container"},
+		{"serialization", "serial"},
+		{"initialization", "initial"},
 	}
 
 	for _, tt := range tests {

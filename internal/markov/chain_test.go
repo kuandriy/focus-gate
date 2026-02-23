@@ -66,13 +66,52 @@ func TestPredictEmpty(t *testing.T) {
 	}
 }
 
-func TestSelfTransition(t *testing.T) {
+func TestSelfTransitionSkipped(t *testing.T) {
 	c := New()
 	c.Record("A", "A")
 	c.Record("A", "A")
 
-	if !approxEqual(c.Probability("A", "A"), 1.0) {
-		t.Errorf("P(A|A) = %f, want 1.0", c.Probability("A", "A"))
+	// Self-transitions should not be recorded
+	if c.TransitionCount() != 0 {
+		t.Errorf("TransitionCount = %d, want 0 (self-transitions skipped)", c.TransitionCount())
+	}
+	if c.Probability("A", "A") != 0 {
+		t.Errorf("P(A|A) = %f, want 0 (self-transitions skipped)", c.Probability("A", "A"))
+	}
+}
+
+func TestSelfTransitionDoesNotAffectOthers(t *testing.T) {
+	c := New()
+	c.Record("A", "B")
+	c.Record("A", "A") // should be skipped
+	c.Record("A", "C")
+
+	if c.TransitionCount() != 2 {
+		t.Errorf("TransitionCount = %d, want 2", c.TransitionCount())
+	}
+	if !approxEqual(c.Probability("A", "B"), 0.5) {
+		t.Errorf("P(B|A) = %f, want 0.5", c.Probability("A", "B"))
+	}
+	if !approxEqual(c.Probability("A", "C"), 0.5) {
+		t.Errorf("P(C|A) = %f, want 0.5", c.Probability("A", "C"))
+	}
+}
+
+func TestAlternatingTransitions(t *testing.T) {
+	c := New()
+	c.Record("A", "B")
+	c.Record("B", "A")
+	c.Record("A", "B")
+	c.Record("B", "A")
+
+	if !approxEqual(c.Probability("A", "B"), 1.0) {
+		t.Errorf("P(B|A) = %f, want 1.0", c.Probability("A", "B"))
+	}
+	if !approxEqual(c.Probability("B", "A"), 1.0) {
+		t.Errorf("P(A|B) = %f, want 1.0", c.Probability("B", "A"))
+	}
+	if c.Predict("A") != "B" {
+		t.Errorf("Predict(A) = %q, want B", c.Predict("A"))
 	}
 }
 

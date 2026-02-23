@@ -4,6 +4,7 @@ package forest
 type LeafEntry struct {
 	Node    *Node
 	TreeIdx int
+	TreeID  string // stable identifier, survives tree-slice reordering
 	Score   float64
 }
 

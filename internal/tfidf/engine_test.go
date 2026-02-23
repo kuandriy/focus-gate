@@ -72,22 +72,61 @@ func TestEngineIDF(t *testing.T) {
 	e.AddDocument([]string{"auth", "session"})
 	e.AddDocument([]string{"database", "schema"})
 
-	// "auth" appears in 2/3 docs: log2(1 + 3/2) = log2(2.5) ≈ 1.322
+	// TotalDocs=3, but effective is max(3, MinVirtualDocs=5)
+	// "auth" appears in 2/3 docs: log2(1 + 5/2) = log2(3.5) ≈ 1.807
 	authIDF := e.IDF("auth")
-	expected := math.Log2(1 + 3.0/2.0)
+	expected := math.Log2(1 + 5.0/2.0)
 	if math.Abs(authIDF-expected) > 1e-10 {
 		t.Errorf("IDF(auth) = %f, want %f", authIDF, expected)
 	}
 
-	// "token" appears in 1/3 docs: log2(1 + 3/1) = log2(4) = 2.0
+	// "token" appears in 1/3 docs: log2(1 + 5/1) = log2(6) ≈ 2.585
 	tokenIDF := e.IDF("token")
-	if math.Abs(tokenIDF-2.0) > 1e-10 {
-		t.Errorf("IDF(token) = %f, want 2.0", tokenIDF)
+	expectedToken := math.Log2(1 + 5.0/1.0)
+	if math.Abs(tokenIDF-expectedToken) > 1e-10 {
+		t.Errorf("IDF(token) = %f, want %f", tokenIDF, expectedToken)
 	}
 
 	// Unknown term
 	if e.IDF("unknown") != 0 {
 		t.Error("IDF of unknown term should be 0")
+	}
+}
+
+func TestEngineIDFFloorDisappearsAtScale(t *testing.T) {
+	e := NewEngine()
+	for i := 0; i < 10; i++ {
+		e.AddDocument([]string{"common"})
+	}
+	e.AddDocument([]string{"rare"})
+
+	// TotalDocs=11, above MinVirtualDocs=5 — floor has no effect
+	// "rare" in 1/11: log2(1 + 11/1) = log2(12)
+	rareIDF := e.IDF("rare")
+	expected := math.Log2(1 + 11.0/1.0)
+	if math.Abs(rareIDF-expected) > 1e-10 {
+		t.Errorf("IDF(rare) at scale = %f, want %f", rareIDF, expected)
+	}
+}
+
+func TestColdStartDiscrimination(t *testing.T) {
+	e := NewEngine()
+	// Single document about auth
+	e.AddDocument([]string{"auth", "jwt", "token"})
+
+	// With MinVirtualDocs floor, terms in 1 doc should get IDF > 1.0
+	// (without the floor, all terms would get log2(1+1/1) = 1.0)
+	idf := e.IDF("auth")
+	if idf <= 1.0 {
+		t.Errorf("cold-start IDF = %f, want > 1.0 (floor should boost discrimination)", idf)
+	}
+
+	// Two different prompts should produce low cosine similarity even at 1 doc
+	authVec := e.VectorizeTokens([]string{"auth", "jwt", "token"})
+	dbVec := e.VectorizeTokens([]string{"databas", "migrat", "schema"})
+	sim := CosineSimilarity(authVec, dbVec)
+	if sim > 0.01 {
+		t.Errorf("dissimilar prompts at cold start: cosine = %f, want ~ 0.0", sim)
 	}
 }
 
