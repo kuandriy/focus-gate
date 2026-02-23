@@ -14,6 +14,8 @@ Zero external dependencies. Single binary. Built entirely on Go's standard libra
 - [How It Works](#how-it-works)
 - [Install](#install)
 - [Usage](#usage)
+  - [In-Chat Commands](#in-chat-commands)
+  - [CLI Flags](#cli-flags)
 - [Algorithms](#algorithms)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
@@ -158,36 +160,106 @@ Add to `.claude/settings.local.json`:
 }
 ```
 
-### CLI
+### In-Chat Commands
+
+Type any `/focus` command directly in your Claude Code conversation. The command is intercepted before classification — **no state is modified**, the output appears inline as context.
+
+| Command | Description |
+|:---|:---|
+| `/focus status` | Compact context summary (same output the AI normally sees) |
+| `/focus inspect` | Full state dump — forest hierarchy, TF-IDF, guide, Markov |
+| `/focus tree` | List all trees with scores |
+| `/focus tree 0` | Deep-dive into tree #0 — full node hierarchy, vector terms, pruning candidates |
+| `/focus tree abc123` | Deep-dive by partial tree ID |
+| `/focus terms` | TF-IDF vocabulary — top 30 terms with DF and IDF values |
+| `/focus terms 50` | Show top 50 terms |
+| `/focus markov` | Transition matrix with probabilities |
+| `/focus score "prompt"` | Dry-run classification — see how a prompt would be scored without sending it |
+| `/focus health` | System diagnostics — memory pressure, tree balance, staleness, pruning forecast |
+| `/focus help` | List all available commands |
+
+#### Example: `/focus health`
+
+```
+=== Focus Health ===
+
+  Memory:  42/100 nodes (42%) [█████░░░░░░░]
+  Trees:   3 (nodes per tree: min=8 avg=14.0 max=22, max depth=3)
+  Prompts: 42
+
+  TF-IDF:  38 docs, 127 unique terms
+           31 terms with df=1 (noise: 24%)
+
+  Tree activity:
+    #0 [HOT]   score=0.952  age=5m   "authentication and JWT tokens"
+    #1 [WARM]  score=0.614  age=2.3h "database migration schema"
+    #2 [COLD]  score=0.089  age=1.2d "readme documentation project"
+
+  Pruning forecast (lowest-scoring leaves):
+    [PRUNE?] tree#2 a1b2c3d4  score=0.0312  "update project description"
+    [PRUNE?] tree#2 e5f6g7h8  score=0.0487  "add license section"
+    [PRUNE?] tree#1 i9j0k1l2  score=0.1205  "add index on email column"
+
+    58 slots remaining before pruning triggers.
+
+  Markov:  2 topics tracked, last=a1b2c3d4 (authentication...)
+```
+
+#### Example: `/focus tree 0`
+
+```
+=== Tree: a1b2c3d4e5f6 ===
+  Nodes: 4, Leaves: 3
+  Created:  2026-02-22 10:03:15
+  Accessed: 2026-02-22 14:22:08
+  Root score: 0.952
+
+  [root] a1b2c3d4  d=0 w=1.58 f=2 idx=- s=0.952
+  "token | authentica | session | jwt"
+  ├── b2c3d4e5  d=1 w=1.00 f=1 idx=Y s=0.871
+  │   "add JWT authentication to the API"
+  ├── c3d4e5f6  d=1 w=1.00 f=1 idx=Y s=0.843
+  │   "fix the session expiry bug"
+  └── d4e5f6g7  d=1 w=1.58 f=2 idx=Y s=0.921
+      "add refresh token rotation"
+
+  Root vector terms:
+    token                0.4821
+    authentica           0.3912
+    session              0.3654
+    jwt                  0.3201
+
+  Pruning candidates (lowest score first):
+    [PRUNE?] c3d4e5f6  score=0.843  "fix the session expiry bug"
+    [PRUNE?] b2c3d4e5  score=0.871  "add JWT authentication to the API"
+```
+
+### CLI Flags
 
 ```bash
-# Show current forest state
+# Show current context (same as /focus status)
 ./focus-gate --status
 
 # Reset all tracking data
 ./focus-gate --reset
 
-# Inspect full internal state (forest, TF-IDF, guide, Markov)
+# Full state dump (same as /focus inspect)
 ./focus-gate --inspect
 
-# Inspect with JSON output for programmatic analysis
+# Full state dump as JSON
 ./focus-gate --inspect --json
 
-# Dry-run: classify a prompt without modifying any state
+# Dry-run classification (same as /focus score)
 ./focus-gate --dry-run "your prompt text here"
 
-# Dry-run with JSON output
+# Dry-run as JSON
 ./focus-gate --dry-run "your prompt text" --json
 
 # Process a prompt (hook mode, reads JSON from stdin)
 echo '{"prompt":"your prompt text"}' | ./focus-gate
 ```
 
-#### Observability
-
-**`--inspect`** dumps the complete internal state in a single view: all forest trees with their full node hierarchy (IDs, depth, weight, frequency, indexed flag, decay score), TF-IDF corpus statistics (total documents, top terms by document frequency), guide entries with reinforcement state, and the Markov transition matrix with probabilities. Add `--json` for machine-readable output.
-
-**`--dry-run "prompt"`** runs the full classification pipeline — tokenization, TF-IDF vectorization, cosine similarity against every root and leaf, multiplicative Markov boost — and shows exactly what would happen, without mutating any state. The output includes per-tree scoring breakdown and the predicted action (new / branch / extend). Useful for verifying threshold tuning and understanding classification decisions.
+The CLI flags are useful for scripting and programmatic analysis. For day-to-day debugging, the in-chat `/focus` commands are more convenient — no terminal switching required.
 
 ### Context Output
 

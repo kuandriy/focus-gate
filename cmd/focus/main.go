@@ -264,6 +264,12 @@ func handlePrompt(p paths, cfg config) error {
 		return nil
 	}
 
+	// Slash command intercept — /focus <subcommand> runs an inspector
+	// and returns early without modifying any persisted state.
+	if cmd, ok := parseSlashCommand(input.Prompt); ok {
+		return handleSlashCommand(cmd, p, cfg)
+	}
+
 	// Load persisted state
 	f := forest.NewForest()
 	logLoadErr("intent", persist.Load(p.intentFile, f))
