@@ -101,6 +101,8 @@ score = cosine_similarity * (1 + alpha * P(tree | last_topic))
 
 The multiplicative form ensures that a zero-similarity prompt cannot match a tree through transition history alone — Markov only amplifies existing content similarity, acting as a tiebreaker between genuinely related trees.
 
+**Self-transitions are skipped** — when consecutive prompts hit the same tree, no transition is recorded. This prevents `P(A|A)` from inflating and creating redundant stickiness on top of the existing recency/decay mechanism. The prediction line shows genuinely predicted topic *switches*, not the current topic.
+
 `alpha` defaults to 0.2. A prediction line appears in the context output when the top transition probability exceeds 30%:
 
 ```
@@ -116,6 +118,8 @@ The forest has a configurable memory limit (default: 100 nodes). When it fills u
 - **Depth**: Deeper nodes are slightly less valuable than shallow ones
 
 Topics you keep revisiting stay. Topics you mentioned once hours ago fade away.
+
+Pruning builds a min-heap **once**, then pops entries in a loop with **parent cascading** — when a leaf is removed and its parent becomes a new leaf (and is not a root), the parent is pushed onto the heap as a pruning candidate. Trees are tracked by stable ID rather than slice index, so removals mid-loop don't corrupt references.
 
 Nodes carry an **indexed** flag that tracks whether their content was registered with the TF-IDF engine. Only real user-prompt nodes are indexed; synthetic bubble-up abstractions are not. During pruning, only indexed content triggers `RemoveDocument`, preventing document-frequency counters from drifting over long sessions.
 
@@ -221,7 +225,7 @@ This means both user prompts and AI responses shape the intent forest. When you 
 [TF-IDF](https://en.wikipedia.org/wiki/Tf%E2%80%93idf) converts text into numerical vectors where each dimension represents a term's importance.
 
 - **Term Frequency (TF)**: `count(term in doc) / length(doc)`
-- **Inverse Document Frequency (IDF)**: `log2(1 + totalDocs / df(term))` — rare terms score higher
+- **Inverse Document Frequency (IDF)**: `log2(1 + effectiveDocs / df(term))` — rare terms score higher. `effectiveDocs` is `max(totalDocs, 5)` — a virtual floor that ensures IDF can discriminate between terms even during the first few prompts of a session, when the corpus is too small for meaningful frequency statistics
 - **TF-IDF**: `TF * IDF`
 
 ### Cosine Similarity
@@ -246,8 +250,9 @@ Node vectors are **cached** after first computation and invalidated when content
 
 ### Stemmer
 
-A lightweight two-pass suffix stemmer:
+A lightweight two-pass suffix stemmer with an override map for known false conflations:
 
+- **Override map**: Checked first — prevents mechanical suffix stripping from producing unrelated roots (e.g. "authorization" → "author", "organization" → "organ"). Overridden words stem to a consistent form ("authoriz", "organiz") that groups related variants correctly.
 - **Pass 1**: Strip plurals (`-ies` -> `-y`, `-es` -> strip, `-s` -> strip)
 - **Pass 2**: Strip one derivational suffix (longest match: `-ization`, `-tion`, `-ment`, `-ing`, `-ed`, etc.)
 
@@ -255,11 +260,14 @@ A lightweight two-pass suffix stemmer:
 
 ### Bubble-Up Abstraction
 
-After any tree modification, parent node content is regenerated bottom-up. Leaf nodes hold actual prompt text; parents hold the top N most frequent terms across their children, pipe-separated:
+After any tree modification, parent node content is regenerated bottom-up. Leaf nodes hold actual prompt text; parents hold the top N terms across their children, pipe-separated, scored by **presence × IDF**:
+
+- **Presence**: How many children contain the term (not raw frequency — a term in 3 of 4 children scores higher than a term repeated 5 times in 1 child)
+- **IDF**: Inverse document frequency from the TF-IDF engine — suppresses corpus-common terms like "add" or "fix" that survive stop-word filtering, promoting distinctive topic terms
 
 ```
 Children:                          Parent becomes:
-  "add JWT authentication"         "token | jwt | authentica | session"
+  "add JWT authentication"         "jwt | token | authentica | session"
   "fix session expiry bug"
   "add refresh token rotation"
 ```
