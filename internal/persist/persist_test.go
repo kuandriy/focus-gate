@@ -38,7 +38,7 @@ func TestSaveCreatesDirectory(t *testing.T) {
 		t.Fatalf("SaveAtomic with nested dirs failed: %v", err)
 	}
 
-	if !Exists(path) {
+	if !exists(path) {
 		t.Error("file should exist after save")
 	}
 }
@@ -70,7 +70,7 @@ func TestSaveAtomicNoPartialWrite(t *testing.T) {
 
 	// No .tmp file should remain
 	tmp := path + ".tmp"
-	if Exists(tmp) {
+	if exists(tmp) {
 		t.Error(".tmp file should not exist after successful save")
 	}
 
@@ -89,14 +89,14 @@ func TestRemove(t *testing.T) {
 	path := filepath.Join(dir, "test.json")
 
 	os.WriteFile(path, []byte("{}"), 0644)
-	if !Exists(path) {
+	if !exists(path) {
 		t.Fatal("file should exist before removal")
 	}
 
 	if err := Remove(path); err != nil {
 		t.Fatalf("Remove failed: %v", err)
 	}
-	if Exists(path) {
+	if exists(path) {
 		t.Error("file should not exist after removal")
 	}
 

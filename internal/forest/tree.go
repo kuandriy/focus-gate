@@ -90,21 +90,6 @@ func (t *Tree) GetLeaves() []*Node {
 	return leaves
 }
 
-// GetChildren returns the direct children of a node.
-func (t *Tree) GetChildren(nodeID string) []*Node {
-	node := t.Nodes[nodeID]
-	if node == nil {
-		return nil
-	}
-	children := make([]*Node, 0, len(node.ChildIDs))
-	for _, cid := range node.ChildIDs {
-		if child := t.Nodes[cid]; child != nil {
-			children = append(children, child)
-		}
-	}
-	return children
-}
-
 // NodeCount returns the total number of nodes in this tree.
 func (t *Tree) NodeCount() int {
 	return len(t.Nodes)

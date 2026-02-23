@@ -45,8 +45,8 @@ func SaveAtomic(path string, v any) error {
 func RecoverTmpFiles(paths ...string) {
 	for _, path := range paths {
 		tmp := path + ".tmp"
-		tmpExists := Exists(tmp)
-		targetExists := Exists(path)
+		tmpExists := exists(tmp)
+		targetExists := exists(path)
 
 		if !tmpExists {
 			continue
@@ -90,8 +90,8 @@ func Remove(path string) error {
 	return nil
 }
 
-// Exists returns true if the file exists.
-func Exists(path string) bool {
+// exists returns true if the file exists.
+func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }

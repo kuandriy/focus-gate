@@ -2,10 +2,9 @@ package forest
 
 // LeafEntry is a scored leaf for the pruning heap.
 type LeafEntry struct {
-	Node    *Node
-	TreeIdx int
-	TreeID  string // stable identifier, survives tree-slice reordering
-	Score   float64
+	Node   *Node
+	TreeID string // stable identifier, survives tree-slice reordering
+	Score  float64
 }
 
 // LeafHeap implements container/heap.Interface as a min-heap ordered by Score.

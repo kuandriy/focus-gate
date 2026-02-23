@@ -6,12 +6,12 @@ import (
 	"github.com/kuandriy/focus-gate/internal/text"
 )
 
-// MinVirtualDocs is the minimum effective corpus size used in the IDF
+// minVirtualDocs is the minimum effective corpus size used in the IDF
 // denominator. With fewer than this many real documents, IDF pretends the
 // corpus is this large so that term weights can discriminate even during
-// the first few prompts of a session. Once TotalDocs >= MinVirtualDocs,
+// the first few prompts of a session. Once TotalDocs >= minVirtualDocs,
 // this floor has no effect.
-const MinVirtualDocs = 5
+const minVirtualDocs = 5
 
 // Engine is an incremental TF-IDF engine. Unlike rebuilding the entire corpus
 // on every invocation, it persists document frequency counts and updates them
@@ -70,8 +70,8 @@ func (e *Engine) IDF(term string) float64 {
 		return 0
 	}
 	effectiveDocs := e.TotalDocs
-	if effectiveDocs < MinVirtualDocs {
-		effectiveDocs = MinVirtualDocs
+	if effectiveDocs < minVirtualDocs {
+		effectiveDocs = minVirtualDocs
 	}
 	return math.Log2(1 + float64(effectiveDocs)/float64(df))
 }

@@ -38,28 +38,6 @@ func (f *Forest) NodeCount() int {
 	return count
 }
 
-// AllLeaves returns all leaf nodes across all trees with their tree index.
-// decayRate controls the exponential time-decay applied to each node's score.
-func (f *Forest) AllLeaves(decayRate float64) []LeafEntry {
-	var entries []LeafEntry
-	now := time.Now().UnixMilli()
-	for i, t := range f.Trees {
-		for _, n := range t.GetLeaves() {
-			// Skip root nodes — they should not be pruned directly
-			if n.ID == t.RootID {
-				continue
-			}
-			entries = append(entries, LeafEntry{
-				Node:    n,
-				TreeIdx: i,
-				TreeID:  t.ID,
-				Score:   n.Score(now, decayRate),
-			})
-		}
-	}
-	return entries
-}
-
 // Prune removes the lowest-scoring leaves until the forest fits within memorySize.
 // Builds the min-heap once, then pops entries in a loop with parent cascading.
 // When a leaf is removed and its parent becomes a new leaf (and is not a root),
@@ -188,12 +166,4 @@ func (f *Forest) Prune(memorySize int, decayRate float64) []string {
 func (f *Forest) AddTree(t *Tree) {
 	f.Trees = append(f.Trees, t)
 	f.Meta.LastUpdate = time.Now().UnixMilli()
-}
-
-// RemoveTree removes a tree by index.
-func (f *Forest) RemoveTree(idx int) {
-	if idx >= 0 && idx < len(f.Trees) {
-		f.Trees = append(f.Trees[:idx], f.Trees[idx+1:]...)
-		f.Meta.LastUpdate = time.Now().UnixMilli()
-	}
 }
