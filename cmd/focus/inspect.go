@@ -10,7 +10,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
@@ -36,9 +35,9 @@ func hasFlag(args []string, flag string) bool {
 
 // handleInspect loads all persisted state and prints a comprehensive view of
 // every data structure: forest trees with full node hierarchy, TF-IDF corpus
-// statistics, guide entries with reinforcement state, and the Markov transition
-// matrix. This lets the user verify at a glance whether the system is tracking
-// intent correctly after a series of prompts.
+// statistics, and guide entries with reinforcement state. This lets the user
+// verify at a glance whether the system is tracking intent correctly after a
+// series of prompts.
 func handleInspect(p paths, cfg config, asJSON bool) error {
 	f := forest.NewForest()
 	logLoadErr("intent", persist.Load(p.intentFile, f))
@@ -49,13 +48,10 @@ func handleInspect(p paths, cfg config, asJSON bool) error {
 	g := guide.New(cfg.GuideSize)
 	logLoadErr("guide", persist.Load(p.guideFile, g))
 
-	c := markov.New()
-	logLoadErr("markov", persist.Load(p.markovFile, c))
-
 	if asJSON {
-		return inspectJSON(f, e, g, c, cfg)
+		return inspectJSON(f, e, g, cfg)
 	}
-	return inspectText(f, e, g, c, cfg)
+	return inspectText(f, e, g, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -76,16 +72,13 @@ func handleDryRun(p paths, cfg config, prompt string, asJSON bool) error {
 	g := guide.New(cfg.GuideSize)
 	logLoadErr("guide", persist.Load(p.guideFile, g))
 
-	c := markov.New()
-	logLoadErr("markov", persist.Load(p.markovFile, c))
-
 	// Clean the prompt the same way the hook path does.
 	prompt = text.CleanPrompt(prompt)
 	if prompt == "" {
 		return fmt.Errorf("prompt is empty after cleaning")
 	}
 
-	gt := gate.NewWithChain(f, e, c, toGateConfig(cfg))
+	gt := gate.New(f, e, toGateConfig(cfg))
 	result := gt.DryRun(prompt)
 
 	if asJSON {
@@ -98,7 +91,7 @@ func handleDryRun(p paths, cfg config, prompt string, asJSON bool) error {
 // Text formatters
 // ---------------------------------------------------------------------------
 
-func inspectText(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Chain, cfg config) error {
+func inspectText(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
 	w := os.Stdout
 	now := time.Now().UnixMilli()
 
@@ -113,9 +106,7 @@ func inspectText(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Ch
 	fmt.Fprintf(w, "  similarity.branch: %.3f\n", cfg.Similarity.Branch)
 	fmt.Fprintf(w, "  contextLimit:      %d\n", cfg.ContextLimit)
 	fmt.Fprintf(w, "  bubbleUpTerms:     %d\n", cfg.BubbleUpTerms)
-	fmt.Fprintf(w, "  maxSourcesPerNode: %d\n", cfg.MaxSourcesPerNode)
 	fmt.Fprintf(w, "  guideSize:         %d\n", cfg.GuideSize)
-	fmt.Fprintf(w, "  transitionBoost:   %.3f\n", cfg.TransitionBoost)
 	fmt.Fprintln(w)
 
 	// --- Forest ---
@@ -170,58 +161,6 @@ func inspectText(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Ch
 	}
 	fmt.Fprintln(w)
 
-	// --- Markov ---
-	fmt.Fprintln(w, "--- Markov Chain ---")
-	if c.LastTopic != "" {
-		name := treeNameByID(f, c.LastTopic)
-		fmt.Fprintf(w, "  Last topic: %s", c.LastTopic)
-		if name != "" {
-			fmt.Fprintf(w, " (%s)", name)
-		}
-		fmt.Fprintln(w)
-	} else {
-		fmt.Fprintln(w, "  Last topic: (none)")
-	}
-
-	// Sort transition sources for deterministic output.
-	froms := make([]string, 0, len(c.Counts))
-	for from := range c.Counts {
-		froms = append(froms, from)
-	}
-	sort.Strings(froms)
-
-	for _, from := range froms {
-		row := c.Counts[from]
-		total := c.Totals[from]
-		name := treeNameByID(f, from)
-		if name != "" {
-			fmt.Fprintf(w, "  %s (%s) ->\n", from, name)
-		} else {
-			fmt.Fprintf(w, "  %s ->\n", from)
-		}
-
-		// Sort destinations by count descending.
-		type dest struct {
-			to    string
-			count int
-		}
-		dests := make([]dest, 0, len(row))
-		for to, count := range row {
-			dests = append(dests, dest{to, count})
-		}
-		sort.Slice(dests, func(i, j int) bool { return dests[i].count > dests[j].count })
-
-		for _, d := range dests {
-			prob := float64(d.count) / float64(total) * 100
-			dName := treeNameByID(f, d.to)
-			if dName != "" {
-				fmt.Fprintf(w, "    %s (%s): %d/%d (%.1f%%)\n", d.to, dName, d.count, total, prob)
-			} else {
-				fmt.Fprintf(w, "    %s: %d/%d (%.1f%%)\n", d.to, d.count, total, prob)
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -255,9 +194,9 @@ func dryRunText(result gate.DryRunResult, cfg config) error {
 			if len(rootContent) > 50 {
 				rootContent = rootContent[:50] + "..."
 			}
-			fmt.Fprintf(w, "  Tree #%d %q  [boost=%.3f]\n", ts.TreeIdx, rootContent, ts.BoostFactor)
-			fmt.Fprintf(w, "    Root %-14s  cosine=%.4f  boosted=%.4f\n",
-				ts.RootID, ts.RootCosine, ts.RootBoosted)
+			fmt.Fprintf(w, "  Tree #%d %q\n", ts.TreeIdx, rootContent)
+			fmt.Fprintf(w, "    Root %-14s  cosine=%.4f\n",
+				ts.RootID, ts.RootCosine)
 
 			for _, ls := range ts.LeafScores {
 				leafContent := ls.Content
@@ -268,8 +207,8 @@ func dryRunText(result gate.DryRunResult, cfg config) error {
 				if ls.LeafID == result.BestLeaf && result.BestTree == ts.TreeIdx {
 					marker = "  <- BEST"
 				}
-				fmt.Fprintf(w, "    Leaf %-14s  cosine=%.4f  boosted=%.4f  %q%s\n",
-					ls.LeafID, ls.Cosine, ls.Boosted, leafContent, marker)
+				fmt.Fprintf(w, "    Leaf %-14s  cosine=%.4f  %q%s\n",
+					ls.LeafID, ls.Cosine, leafContent, marker)
 			}
 			fmt.Fprintln(w)
 		}
@@ -305,7 +244,6 @@ type jsonInspect struct {
 	Forest jsonForest `json:"forest"`
 	TFIDF  jsonTFIDF  `json:"tfidf"`
 	Guide  jsonGuide  `json:"guide"`
-	Markov jsonMarkov `json:"markov"`
 }
 
 type jsonForest struct {
@@ -339,7 +277,6 @@ type jsonNode struct {
 	Score        float64    `json:"score"`
 	Created      int64      `json:"created"`
 	LastAccessed int64      `json:"lastAccessed"`
-	Sources      []string   `json:"sources,omitempty"`
 	Children     []jsonNode `json:"children,omitempty"`
 }
 
@@ -367,25 +304,7 @@ type jsonGuideEntry struct {
 	Timestamp  int64  `json:"timestamp"`
 }
 
-type jsonMarkov struct {
-	LastTopic   string           `json:"lastTopic"`
-	TopicCount  int              `json:"topicCount"`
-	Transitions []jsonTransition `json:"transitions"`
-}
-
-type jsonTransition struct {
-	From  string        `json:"from"`
-	Total int           `json:"total"`
-	To    []jsonTransTo `json:"to"`
-}
-
-type jsonTransTo struct {
-	TopicID     string  `json:"topicId"`
-	Count       int     `json:"count"`
-	Probability float64 `json:"probability"`
-}
-
-func inspectJSON(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Chain, cfg config) error {
+func inspectJSON(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
 	now := time.Now().UnixMilli()
 
 	// Build forest tree structures
@@ -425,26 +344,6 @@ func inspectJSON(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Ch
 		}
 	}
 
-	// Build Markov transitions
-	transitions := make([]jsonTransition, 0, len(c.Counts))
-	for from, row := range c.Counts {
-		total := c.Totals[from]
-		tos := make([]jsonTransTo, 0, len(row))
-		for to, count := range row {
-			tos = append(tos, jsonTransTo{
-				TopicID:     to,
-				Count:       count,
-				Probability: float64(count) / float64(total),
-			})
-		}
-		sort.Slice(tos, func(i, j int) bool { return tos[i].Count > tos[j].Count })
-		transitions = append(transitions, jsonTransition{
-			From:  from,
-			Total: total,
-			To:    tos,
-		})
-	}
-
 	result := jsonInspect{
 		Config: cfg,
 		Forest: jsonForest{
@@ -465,11 +364,6 @@ func inspectJSON(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Ch
 			Count:   len(g.Entries),
 			MaxSize: g.MaxSize,
 			Entries: guideEntries,
-		},
-		Markov: jsonMarkov{
-			LastTopic:   c.LastTopic,
-			TopicCount:  len(c.Counts),
-			Transitions: transitions,
 		},
 	}
 
@@ -569,7 +463,6 @@ func buildNodeJSON(tree *forest.Tree, nodeID string, now int64, decayRate float6
 		Score:        node.Score(now, decayRate),
 		Created:      node.Created,
 		LastAccessed: node.LastAccessed,
-		Sources:      node.Sources,
 	}
 
 	for _, childID := range node.ChildIDs {

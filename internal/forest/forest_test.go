@@ -18,9 +18,6 @@ func TestNewNode(t *testing.T) {
 	if n.Frequency != 1 {
 		t.Errorf("Frequency = %d, want 1", n.Frequency)
 	}
-	if len(n.Sources) != 1 || n.Sources[0] != "src1" {
-		t.Errorf("Sources = %v, want [src1]", n.Sources)
-	}
 	if !n.IsLeaf() {
 		t.Error("new node should be a leaf")
 	}
@@ -30,15 +27,12 @@ func TestNodeTouch(t *testing.T) {
 	n := NewNode("test", 0, "")
 	origWeight := n.Weight
 
-	n.Touch(20, "src2")
+	n.Touch()
 	if n.Frequency != 2 {
 		t.Errorf("Frequency after touch = %d, want 2", n.Frequency)
 	}
 	if n.Weight <= origWeight {
 		t.Error("Weight should increase after touch")
-	}
-	if len(n.Sources) != 1 || n.Sources[0] != "src2" {
-		t.Errorf("Sources = %v, want [src2]", n.Sources)
 	}
 }
 

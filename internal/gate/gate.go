@@ -2,39 +2,42 @@ package gate
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
 
 // Config holds gate classification parameters.
 type Config struct {
-	ExtendThreshold   float64 `json:"extend"`
-	BranchThreshold   float64 `json:"branch"`
-	BubbleUpTerms     int     `json:"bubbleUpTerms"`
-	MaxSourcesPerNode int     `json:"maxSourcesPerNode"`
-	MemorySize        int     `json:"memorySize"`
-	DecayRate         float64 `json:"decayRate"`
-	ContextLimit      int     `json:"contextLimit"`
-	TransitionBoost   float64 `json:"transitionBoost"`
+	ExtendThreshold float64 `json:"extend"`
+	BranchThreshold float64 `json:"branch"`
+	BubbleUpTerms   int     `json:"bubbleUpTerms"`
+	MaxRefsPerNode  int     `json:"maxRefsPerNode"`
+	MemorySize      int     `json:"memorySize"`
+	DecayRate       float64 `json:"decayRate"`
+	ContextLimit    int     `json:"contextLimit"`
+	SessionTimeout  float64 `json:"sessionTimeout"`  // hours; 0 = disabled
+	MergeSimilarity float64 `json:"mergeSimilarity"` // threshold for cluster merging; 0 = disabled
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ExtendThreshold:   0.55,
-		BranchThreshold:   0.25,
-		BubbleUpTerms:     6,
-		MaxSourcesPerNode: 20,
-		MemorySize:        100,
-		DecayRate:         0.05,
-		ContextLimit:      600,
-		TransitionBoost:   0.2,
+		ExtendThreshold: 0.55,
+		BranchThreshold: 0.25,
+		BubbleUpTerms:   6,
+		MaxRefsPerNode:  5,
+		MemorySize:      100,
+		DecayRate:       0.05,
+		ContextLimit:    600,
+		SessionTimeout:  4.0,
+		MergeSimilarity: 0.7,
 	}
 }
 
@@ -72,7 +75,6 @@ type Classification struct {
 type Gate struct {
 	Forest *forest.Forest
 	Engine *tfidf.Engine
-	Chain  *markov.Chain
 	Config Config
 
 	// vecCache stores pre-computed TF-IDF vectors keyed by node ID. classify()
@@ -85,12 +87,7 @@ type Gate struct {
 
 // New creates a Gate from existing forest and engine state.
 func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
-	return &Gate{Forest: f, Engine: e, Chain: markov.New(), Config: cfg, vecCache: make(map[string]tfidf.Vector)}
-}
-
-// NewWithChain creates a Gate with an existing Markov chain.
-func NewWithChain(f *forest.Forest, e *tfidf.Engine, c *markov.Chain, cfg Config) *Gate {
-	return &Gate{Forest: f, Engine: e, Chain: c, Config: cfg, vecCache: make(map[string]tfidf.Vector)}
+	return &Gate{Forest: f, Engine: e, Config: cfg, vecCache: make(map[string]tfidf.Vector)}
 }
 
 // nodeVec returns the TF-IDF vector for a node, caching the result.
@@ -112,25 +109,16 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 		return ""
 	}
 
+	// Session boundary detection: if the gap since last prompt exceeds the
+	// timeout, penalize all existing tree scores so stale context doesn't
+	// dominate. We halve every node's frequency (which drives weight), making
+	// old trees easier to prune and new prompts more likely to create fresh trees.
+	g.applySessionBoundary()
+
 	vec := g.Engine.VectorizeTokens(tokens)
 
 	cls := g.classify(vec)
 	g.apply(cls, prompt, source, tokens)
-
-	// Determine the tree ID that this prompt was classified into
-	currentTreeID := ""
-	if len(g.Forest.Trees) > 0 {
-		if cls.Action == ActionNew {
-			// New tree was just appended
-			currentTreeID = g.Forest.Trees[len(g.Forest.Trees)-1].ID
-		} else {
-			currentTreeID = g.Forest.Trees[cls.TreeIdx].ID
-		}
-	}
-
-	// Record Markov transition
-	g.Chain.Record(g.Chain.LastTopic, currentTreeID)
-	g.Chain.LastTopic = currentTreeID
 
 	g.Forest.Meta.TotalPrompts++
 	g.Forest.Meta.LastUpdate = g.Forest.Trees[len(g.Forest.Trees)-1].LastAccessed
@@ -142,50 +130,36 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	// so all previously cached vectors are stale.
 	g.vecCache = make(map[string]tfidf.Vector)
 
-	// Prune if needed — track which trees existed before pruning
+	// Prune if needed
 	if g.Forest.NodeCount() > g.Config.MemorySize {
-		treeIDs := make(map[string]bool, len(g.Forest.Trees))
-		for _, t := range g.Forest.Trees {
-			treeIDs[t.ID] = true
-		}
-
 		removed := g.Forest.Prune(g.Config.MemorySize, g.Config.DecayRate)
 		for _, content := range removed {
 			g.Engine.RemoveDocument(text.Tokenize(content))
 		}
-
-		// Sync Markov chain: prune topics for trees that were removed
-		for id := range treeIDs {
-			found := false
-			for _, t := range g.Forest.Trees {
-				if t.ID == id {
-					found = true
-					break
-				}
-			}
-			if !found {
-				g.Chain.PruneTopic(id)
-			}
-		}
 	}
+
+	// Cluster merging: after classification and pruning, check for trees that
+	// have drifted toward the same topic and merge the smaller into the larger.
+	g.tryMerge()
 
 	return g.GenerateContext()
 }
 
-// classify compares the prompt vector against all tree roots and leaves,
-// applying a Markov transition boost per tree to break ties.
-//
-// Scoring uses multiplicative boost: score = cosine(prompt, node) * (1 + α*P)
-// where P is the transition probability from the last topic to this tree.
-// Multiplicative form ensures zero cosine stays zero — Markov history cannot
-// force a match with unrelated content, only amplify existing similarity.
+// classify compares the prompt vector against all tree roots and leaves.
 func (g *Gate) classify(vec tfidf.Vector) Classification {
+	cls, _ := g.classifyDetailed(vec, false)
+	return cls
+}
+
+// classifyDetailed compares the prompt vector against all tree roots and leaves.
+// When detailed is true, per-tree scoring data is returned for dry-run diagnostics.
+func (g *Gate) classifyDetailed(vec tfidf.Vector, detailed bool) (Classification, []TreeScore) {
 	if len(g.Forest.Trees) == 0 || vec == nil {
-		return Classification{Action: ActionNew, Score: 0}
+		return Classification{Action: ActionNew, Score: 0}, nil
 	}
 
 	best := Classification{Action: ActionNew, Score: 0}
-	alpha := g.Config.TransitionBoost
+	var scores []TreeScore
 
 	for i, tree := range g.Forest.Trees {
 		root := tree.Root()
@@ -193,31 +167,46 @@ func (g *Gate) classify(vec tfidf.Vector) Classification {
 			continue
 		}
 
-		// Markov boost factor: neutral (1.0) when no transition data exists,
-		// scaled up to (1 + α) for high-probability transitions.
-		boostFactor := 1.0
-		if alpha > 0 && g.Chain.LastTopic != "" {
-			boostFactor = 1.0 + alpha*g.Chain.Probability(g.Chain.LastTopic, tree.ID)
-		}
-
 		// Compare against root
 		rootVec := g.nodeVec(root.ID, root.Content)
-		rootSim := tfidf.CosineSimilarity(vec, rootVec) * boostFactor
-		if rootSim > best.Score {
-			best.Score = rootSim
+		rootCosine := tfidf.CosineSimilarity(vec, rootVec)
+		if rootCosine > best.Score {
+			best.Score = rootCosine
 			best.TreeIdx = i
 			best.LeafID = ""
+		}
+
+		var ts TreeScore
+		if detailed {
+			ts = TreeScore{
+				TreeIdx:     i,
+				TreeID:      tree.ID,
+				RootID:      root.ID,
+				RootContent: root.Content,
+				RootCosine:  rootCosine,
+			}
 		}
 
 		// Compare against each leaf
 		for _, leaf := range tree.GetLeaves() {
 			leafVec := g.nodeVec(leaf.ID, leaf.Content)
-			leafSim := tfidf.CosineSimilarity(vec, leafVec) * boostFactor
-			if leafSim > best.Score {
-				best.Score = leafSim
+			leafCosine := tfidf.CosineSimilarity(vec, leafVec)
+			if leafCosine > best.Score {
+				best.Score = leafCosine
 				best.TreeIdx = i
 				best.LeafID = leaf.ID
 			}
+			if detailed {
+				ts.LeafScores = append(ts.LeafScores, LeafScore{
+					LeafID:  leaf.ID,
+					Content: leaf.Content,
+					Cosine:  leafCosine,
+				})
+			}
+		}
+
+		if detailed {
+			scores = append(scores, ts)
 		}
 	}
 
@@ -229,15 +218,18 @@ func (g *Gate) classify(vec tfidf.Vector) Classification {
 		best.Action = ActionNew
 	}
 
-	return best
+	return best, scores
 }
 
 // apply mutates the forest based on the classification.
 func (g *Gate) apply(cls Classification, content string, source string, tokens []string) {
+	refs := text.ExtractFilePaths(content, g.Config.MaxRefsPerNode)
+
 	switch cls.Action {
 	case ActionNew:
 		tree := forest.NewTree(content, source)
 		tree.Root().Indexed = true // real user prompt — register in TF-IDF
+		tree.Root().Refs = refs
 		g.Forest.AddTree(tree)
 
 	case ActionBranch:
@@ -246,6 +238,7 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 		child := tree.AddChild(tree.RootID, content, source)
 		if child != nil {
 			child.Indexed = true
+			child.Refs = refs
 		}
 		g.bubbleUp(tree, tree.RootID)
 
@@ -258,6 +251,7 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 			child := tree.AddChild(tree.RootID, content, source)
 			if child != nil {
 				child.Indexed = true
+				child.Refs = refs
 			}
 		} else {
 			parentID := leaf.ParentID
@@ -269,6 +263,7 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 			child := tree.AddChild(parentID, content, source)
 			if child != nil {
 				child.Indexed = true
+				child.Refs = refs
 			}
 		}
 		g.bubbleUp(tree, tree.RootID)
@@ -286,13 +281,13 @@ func (g *Gate) preserveRoot(tree *forest.Tree) {
 	// Root is a leaf (single-node tree). Preserve its content as a child.
 	child := tree.AddChild(root.ID, root.Content, "")
 	if child != nil {
-		child.Sources = append(child.Sources, root.Sources...)
 		child.Frequency = root.Frequency
 		child.Weight = root.Weight
 		child.Created = root.Created
 		child.LastAccessed = root.LastAccessed
 		// Inherit the index flag — the child now owns the original prompt content.
 		child.Indexed = root.Indexed
+		child.Refs = root.Refs
 	}
 }
 
@@ -376,113 +371,281 @@ func (g *Gate) bubbleUp(tree *forest.Tree, nodeID string) {
 	delete(g.vecCache, nodeID)
 }
 
-// GenerateContext formats the forest state as a compact context block.
+// GenerateContext formats the forest state as a compact context block using
+// budget-based prioritized rendering. Each phase checks remaining character
+// budget before writing, ensuring the most important information always fits.
+//
+// Phase order:
+//  1. Header [Focus | ...] — always included
+//  2. Top tree (highest score + leaves) — always fits
+//  3. Additional trees — until budget exhausted
+//  4. File refs — for included trees, if budget permits
+//  5. Footer [/Focus]
 func (g *Gate) GenerateContext() string {
 	if len(g.Forest.Trees) == 0 {
 		return ""
 	}
 
-	var b strings.Builder
+	budget := g.Config.ContextLimit
+	if budget <= 0 {
+		budget = 600
+	}
 
-	// Header
-	fmt.Fprintf(&b, "[Focus | %d prompts | %d/%d mem | %d trees]\n",
-		g.Forest.Meta.TotalPrompts,
-		g.Forest.NodeCount(),
-		g.Config.MemorySize,
-		len(g.Forest.Trees))
-
-	// Sort trees by root score descending, with Markov transition boost
+	// Sort trees by root score descending
 	type scoredTree struct {
 		tree  *forest.Tree
 		score float64
 	}
 	scored := make([]scoredTree, len(g.Forest.Trees))
 	now := g.Forest.Trees[0].LastAccessed
-	alpha := g.Config.TransitionBoost
 	for i, t := range g.Forest.Trees {
-		decayScore := t.Root().Score(now, g.Config.DecayRate)
-		// Boost by transition probability from current topic
-		if alpha > 0 && g.Chain.LastTopic != "" {
-			tp := g.Chain.Probability(g.Chain.LastTopic, t.ID)
-			decayScore *= (1 + alpha*tp)
-		}
-		scored[i] = scoredTree{t, decayScore}
+		scored[i] = scoredTree{t, t.Root().Score(now, g.Config.DecayRate)}
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
 	})
 
-	// Limit to top 5 trees
+	// Pre-compute header and footer
+	header := fmt.Sprintf("[Focus | %d prompts | %d/%d mem | %d trees]\n",
+		g.Forest.Meta.TotalPrompts,
+		g.Forest.NodeCount(),
+		g.Config.MemorySize,
+		len(g.Forest.Trees))
+	footer := "[/Focus]\n"
+
+	remaining := budget - len(header) - len(footer)
+	if remaining <= 0 {
+		return header + footer
+	}
+
+	var parts []string
+	var includedTrees []*forest.Tree
+
+	// Phase 2: Top tree — attempt to include the #1 tree first; skipped only if
+	// the budget is too tight to fit even a single tree block.
+	if len(scored) > 0 {
+		block := g.renderTree(scored[0])
+		if len(block) <= remaining {
+			parts = append(parts, block)
+			remaining -= len(block)
+			includedTrees = append(includedTrees, scored[0].tree)
+		}
+	}
+
+	// Phase 3: Additional trees — up to 4 more, budget permitting
 	limit := 5
 	if limit > len(scored) {
 		limit = len(scored)
 	}
-
-	for _, st := range scored[:limit] {
-		fmt.Fprintf(&b, "  [%.2f] %s\n", st.score, st.tree.Root().Content)
-
-		// Show up to 3 recent leaves
-		leaves := st.tree.GetLeaves()
-		sort.Slice(leaves, func(i, j int) bool {
-			return leaves[i].LastAccessed > leaves[j].LastAccessed
-		})
-		leafLimit := 3
-		if leafLimit > len(leaves) {
-			leafLimit = len(leaves)
+	for _, st := range scored[1:limit] {
+		block := g.renderTree(st)
+		if len(block) > remaining {
+			break
 		}
-		for _, leaf := range leaves[:leafLimit] {
-			if leaf.ID == st.tree.RootID {
-				continue // Don't re-show root
+		parts = append(parts, block)
+		remaining -= len(block)
+		includedTrees = append(includedTrees, st.tree)
+	}
+
+	// Phase 4: File refs — add refs for included trees if budget permits
+	for _, tree := range includedTrees {
+		refLine := g.collectTreeRefs(tree, 3)
+		if refLine == "" {
+			continue
+		}
+		if len(refLine) > remaining {
+			break
+		}
+		parts = append(parts, refLine)
+		remaining -= len(refLine)
+	}
+
+	var b strings.Builder
+	b.WriteString(header)
+	for _, p := range parts {
+		b.WriteString(p)
+	}
+	b.WriteString(footer)
+	return b.String()
+}
+
+// renderTree formats a single tree block for context output (without refs).
+func (g *Gate) renderTree(st struct {
+	tree  *forest.Tree
+	score float64
+}) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  [%.2f] %s\n", st.score, st.tree.Root().Content)
+
+	leaves := st.tree.GetLeaves()
+	sort.Slice(leaves, func(i, j int) bool {
+		return leaves[i].LastAccessed > leaves[j].LastAccessed
+	})
+	leafLimit := 3
+	if leafLimit > len(leaves) {
+		leafLimit = len(leaves)
+	}
+	for _, leaf := range leaves[:leafLimit] {
+		if leaf.ID == st.tree.RootID {
+			continue
+		}
+		content := leaf.Content
+		if len(content) > 80 {
+			content = content[:80] + "..."
+		}
+		fmt.Fprintf(&b, "    - %s\n", content)
+	}
+
+	return b.String()
+}
+
+// collectTreeRefs aggregates file path refs from all nodes in a tree,
+// counts by frequency, and returns a formatted line with the top N refs.
+// Returns "" if no refs exist.
+func (g *Gate) collectTreeRefs(tree *forest.Tree, maxRefs int) string {
+	freq := make(map[string]int)
+	for _, node := range tree.Nodes {
+		for _, ref := range node.Refs {
+			freq[ref]++
+		}
+	}
+	if len(freq) == 0 {
+		return ""
+	}
+
+	type refCount struct {
+		path  string
+		count int
+	}
+	ranked := make([]refCount, 0, len(freq))
+	for path, count := range freq {
+		ranked = append(ranked, refCount{path, count})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].count != ranked[j].count {
+			return ranked[i].count > ranked[j].count
+		}
+		return ranked[i].path < ranked[j].path
+	})
+
+	if maxRefs > len(ranked) {
+		maxRefs = len(ranked)
+	}
+	paths := make([]string, maxRefs)
+	for i := 0; i < maxRefs; i++ {
+		paths[i] = ranked[i].path
+	}
+	return fmt.Sprintf("    @ %s\n", strings.Join(paths, ", "))
+}
+
+// applySessionBoundary detects gaps between prompts that exceed SessionTimeout
+// and penalizes existing tree scores to prevent stale context from dominating.
+// When triggered, all node frequencies are halved (reducing weight via log2),
+// making old trees easier to prune and new prompts more likely to create fresh trees.
+func (g *Gate) applySessionBoundary() {
+	if g.Config.SessionTimeout <= 0 || len(g.Forest.Trees) == 0 {
+		return
+	}
+
+	now := time.Now().UnixMilli()
+
+	// LastUpdate is zero when state was loaded from disk but never written by
+	// this version (e.g. first run after upgrading). Treat it as "now" to avoid
+	// a false boundary trigger on the first prompt after an upgrade.
+	if g.Forest.Meta.LastUpdate == 0 {
+		g.Forest.Meta.LastUpdate = now
+		return
+	}
+
+	gapHours := float64(now-g.Forest.Meta.LastUpdate) / 3600000.0
+
+	if gapHours < g.Config.SessionTimeout {
+		return
+	}
+
+	// Halve all node frequencies — reduces weight without destroying state
+	for _, tree := range g.Forest.Trees {
+		for _, node := range tree.Nodes {
+			node.Frequency = (node.Frequency + 1) / 2
+			if node.Frequency < 1 {
+				node.Frequency = 1
 			}
-			content := leaf.Content
-			if len(content) > 80 {
-				content = content[:80] + "..."
+			node.Weight = math.Log2(float64(node.Frequency) + 1)
+		}
+	}
+}
+
+// tryMerge checks all tree pairs for root cosine similarity above MergeSimilarity
+// and merges the smaller tree into the larger. All non-root nodes from the small
+// tree are re-parented as direct children of the large tree's root (flattened).
+// The small root itself is skipped — it is a bubbleUp abstraction, not a real
+// prompt, and the large tree will regenerate its own abstraction after bubbleUp.
+// Only one merge per ProcessPrompt call to avoid cascading merges that could
+// destabilize the forest.
+func (g *Gate) tryMerge() {
+	if g.Config.MergeSimilarity <= 0 || len(g.Forest.Trees) < 2 {
+		return
+	}
+
+	bestSim := 0.0
+	bestI, bestJ := -1, -1
+
+	for i := 0; i < len(g.Forest.Trees); i++ {
+		r1 := g.Forest.Trees[i].Root()
+		if r1 == nil {
+			continue
+		}
+		v1 := g.nodeVec(r1.ID, r1.Content)
+
+		for j := i + 1; j < len(g.Forest.Trees); j++ {
+			r2 := g.Forest.Trees[j].Root()
+			if r2 == nil {
+				continue
 			}
-			fmt.Fprintf(&b, "    - %s\n", content)
+			v2 := g.nodeVec(r2.ID, r2.Content)
+			sim := tfidf.CosineSimilarity(v1, v2)
+			if sim > bestSim {
+				bestSim = sim
+				bestI = i
+				bestJ = j
+			}
 		}
 	}
 
-	// Prediction line: show likely next topics if transition data exists
-	if g.Chain.LastTopic != "" {
-		top := g.Chain.TopTransitions(g.Chain.LastTopic, 3)
-		if len(top) > 0 && top[0].Probability >= 0.3 {
-			b.WriteString("  -> next:")
-			for i, t := range top {
-				// Find tree name for this topic ID
-				name := t.TopicID[:8] // fallback: truncated ID
-				for _, tree := range g.Forest.Trees {
-					if tree.ID == t.TopicID {
-						root := tree.Root()
-						if root != nil {
-							name = root.Content
-							if len(name) > 30 {
-								name = name[:30]
-							}
-						}
-						break
-					}
-				}
-				if i > 0 {
-					b.WriteString(",")
-				}
-				fmt.Fprintf(&b, " %s (%.0f%%)", name, t.Probability*100)
-			}
-			b.WriteString("\n")
+	if bestSim < g.Config.MergeSimilarity || bestI < 0 {
+		return
+	}
+
+	// Merge smaller into larger
+	large, small := g.Forest.Trees[bestI], g.Forest.Trees[bestJ]
+	if large.NodeCount() < small.NodeCount() {
+		large, small = small, large
+		bestI, bestJ = bestJ, bestI
+	}
+
+	// Move all non-root nodes from small under large's root (flat re-parent).
+	// Using Nodes map directly covers leaves AND interior nodes at any depth,
+	// preventing content loss in trees deeper than root→leaf.
+	for _, node := range small.Nodes {
+		if node.ID == small.RootID {
+			continue // root is a computed abstraction; large rebuilds its own
+		}
+		child := large.AddChild(large.RootID, node.Content, "")
+		if child != nil {
+			child.Indexed = node.Indexed
+			child.Frequency = node.Frequency
+			child.Weight = node.Weight
+			child.Created = node.Created
+			child.LastAccessed = node.LastAccessed
+			child.Refs = node.Refs
 		}
 	}
 
-	result := b.String()
+	// Re-run bubble-up on the large tree's root
+	g.bubbleUp(large, large.RootID)
 
-	// Enforce context limit
-	if g.Config.ContextLimit > 0 && len(result) > g.Config.ContextLimit {
-		result = result[:g.Config.ContextLimit]
-		// Trim to last complete line
-		if idx := strings.LastIndex(result, "\n"); idx > 0 {
-			result = result[:idx+1]
-		}
-	}
-
-	return result + "[/Focus]\n"
+	// Remove the small tree from the forest
+	g.Forest.Trees = append(g.Forest.Trees[:bestJ], g.Forest.Trees[bestJ+1:]...)
 }
 
 // ReinforceFromGuide processes unreinforced guide entries against the forest.
@@ -492,8 +655,7 @@ func (g *Gate) GenerateContext() string {
 // and harder to prune).
 //
 // Only Touch is applied — no new nodes or content changes. AI responses confirm
-// existing topics rather than defining new ones. Markov boost is excluded because
-// the transition model captures user navigation patterns, not AI response flow.
+// existing topics rather than defining new ones.
 //
 // Returns the number of entries reinforced, for diagnostic logging.
 func (g *Gate) ReinforceFromGuide(gd *guide.Guide) int {
@@ -535,7 +697,7 @@ func (g *Gate) ReinforceFromGuide(gd *guide.Guide) int {
 		if bestTreeIdx >= 0 && bestScore >= g.Config.BranchThreshold {
 			root := g.Forest.Trees[bestTreeIdx].Root()
 			if root != nil {
-				root.Touch(g.Config.MaxSourcesPerNode, "guide-reinforce")
+				root.Touch()
 				reinforced++
 			}
 		}

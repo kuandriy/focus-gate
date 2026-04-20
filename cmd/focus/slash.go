@@ -12,7 +12,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
@@ -20,7 +19,7 @@ import (
 
 // slashCommand holds the parsed /focus subcommand and its argument (if any).
 type slashCommand struct {
-	sub string // "inspect", "status", "tree", "terms", "markov", "score", "health", "help"
+	sub string // "inspect", "status", "tree", "terms", "score", "health", "help"
 	arg string // e.g. tree index/ID, or prompt text for score
 }
 
@@ -70,17 +69,14 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
 	g := guide.New(cfg.GuideSize)
 	logLoadErr("guide", persist.Load(p.guideFile, g))
 
-	c := markov.New()
-	logLoadErr("markov", persist.Load(p.markovFile, c))
-
 	w := os.Stdout
 
 	switch cmd.sub {
 	case "inspect":
-		return inspectText(f, e, g, c, cfg)
+		return inspectText(f, e, g, cfg)
 
 	case "status":
-		return slashStatus(w, f, e, g, c, cfg)
+		return slashStatus(w, f, e, g, cfg)
 
 	case "tree":
 		return slashTree(w, f, e, cfg, cmd.arg)
@@ -88,14 +84,11 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
 	case "terms":
 		return slashTerms(w, e, cmd.arg)
 
-	case "markov":
-		return slashMarkov(w, f, c)
-
 	case "score":
-		return slashScore(w, f, e, c, cfg, cmd.arg)
+		return slashScore(w, f, e, cfg, cmd.arg)
 
 	case "health":
-		return slashHealth(w, f, e, c, cfg)
+		return slashHealth(w, f, e, cfg)
 
 	case "help":
 		return slashHelp(w)
@@ -109,9 +102,9 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
 // ---------------------------------------------------------------------------
 // /focus status — compact summary (same as --status but in chat)
 // ---------------------------------------------------------------------------
-func slashStatus(w *os.File, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, c *markov.Chain, cfg config) error {
+func slashStatus(w *os.File, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
 	gateCfg := toGateConfig(cfg)
-	gt := gate.NewWithChain(f, e, c, gateCfg)
+	gt := gate.New(f, e, gateCfg)
 	ctx := gt.GenerateContext()
 	if ctx != "" {
 		fmt.Fprint(w, ctx)
@@ -274,71 +267,9 @@ func slashTerms(w *os.File, e *tfidf.Engine, arg string) error {
 }
 
 // ---------------------------------------------------------------------------
-// /focus markov — transition matrix
-// ---------------------------------------------------------------------------
-func slashMarkov(w *os.File, f *forest.Forest, c *markov.Chain) error {
-	if len(c.Counts) == 0 {
-		fmt.Fprintln(w, "[Focus] No Markov transitions recorded yet.")
-		return nil
-	}
-
-	fmt.Fprintln(w, "=== Markov Transition Matrix ===")
-
-	if c.LastTopic != "" {
-		name := treeNameByID(f, c.LastTopic)
-		fmt.Fprintf(w, "  Last topic: %s", c.LastTopic[:8])
-		if name != "" {
-			fmt.Fprintf(w, " (%s)", name)
-		}
-		fmt.Fprintln(w)
-	}
-	fmt.Fprintln(w)
-
-	// Sort sources for deterministic output.
-	froms := make([]string, 0, len(c.Counts))
-	for from := range c.Counts {
-		froms = append(froms, from)
-	}
-	sort.Strings(froms)
-
-	for _, from := range froms {
-		row := c.Counts[from]
-		total := c.Totals[from]
-		name := treeNameByID(f, from)
-		label := from[:8]
-		if name != "" {
-			label += " (" + name + ")"
-		}
-		fmt.Fprintf(w, "  %s ->\n", label)
-
-		type dest struct {
-			to    string
-			count int
-		}
-		dests := make([]dest, 0, len(row))
-		for to, count := range row {
-			dests = append(dests, dest{to, count})
-		}
-		sort.Slice(dests, func(i, j int) bool { return dests[i].count > dests[j].count })
-
-		for _, d := range dests {
-			prob := float64(d.count) / float64(total) * 100
-			dName := treeNameByID(f, d.to)
-			dLabel := d.to[:8]
-			if dName != "" {
-				dLabel += " (" + dName + ")"
-			}
-			fmt.Fprintf(w, "    %s: %d/%d (%.0f%%)\n", dLabel, d.count, total, prob)
-		}
-	}
-
-	return nil
-}
-
-// ---------------------------------------------------------------------------
 // /focus score "prompt" — dry-run scoring from chat
 // ---------------------------------------------------------------------------
-func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, cfg config, arg string) error {
+func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config, arg string) error {
 	if arg == "" {
 		fmt.Fprintln(w, "[Focus] Usage: /focus score <prompt text>")
 		return nil
@@ -350,7 +281,7 @@ func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, 
 		return nil
 	}
 
-	gt := gate.NewWithChain(f, e, c, toGateConfig(cfg))
+	gt := gate.New(f, e, toGateConfig(cfg))
 	result := gt.DryRun(prompt)
 
 	fmt.Fprintln(w, "=== Score ===")
@@ -372,9 +303,9 @@ func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, 
 		if len(rootContent) > 50 {
 			rootContent = rootContent[:50] + "..."
 		}
-		fmt.Fprintf(w, "  Tree #%d %q  [boost=%.3f]\n", ts.TreeIdx, rootContent, ts.BoostFactor)
-		fmt.Fprintf(w, "    Root %-14s  cosine=%.4f  boosted=%.4f\n",
-			ts.RootID[:8], ts.RootCosine, ts.RootBoosted)
+		fmt.Fprintf(w, "  Tree #%d %q\n", ts.TreeIdx, rootContent)
+		fmt.Fprintf(w, "    Root %-14s  cosine=%.4f\n",
+			ts.RootID[:8], ts.RootCosine)
 
 		for _, ls := range ts.LeafScores {
 			leafContent := ls.Content
@@ -385,8 +316,8 @@ func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, 
 			if ls.LeafID == result.BestLeaf && result.BestTree == ts.TreeIdx {
 				marker = "  <- BEST"
 			}
-			fmt.Fprintf(w, "    Leaf %-14s  cosine=%.4f  boosted=%.4f  %q%s\n",
-				ls.LeafID[:8], ls.Cosine, ls.Boosted, leafContent, marker)
+			fmt.Fprintf(w, "    Leaf %-14s  cosine=%.4f  %q%s\n",
+				ls.LeafID[:8], ls.Cosine, leafContent, marker)
 		}
 		fmt.Fprintln(w)
 	}
@@ -399,7 +330,7 @@ func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, 
 // ---------------------------------------------------------------------------
 // /focus health — system diagnostics
 // ---------------------------------------------------------------------------
-func slashHealth(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain, cfg config) error {
+func slashHealth(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config) error {
 	now := time.Now().UnixMilli()
 
 	fmt.Fprintln(w, "=== Focus Health ===")
@@ -555,19 +486,6 @@ func slashHealth(w *os.File, f *forest.Forest, e *tfidf.Engine, c *markov.Chain,
 		}
 	}
 
-	// --- Markov ---
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  Markov:  %d topics tracked", len(c.Counts))
-	if c.LastTopic != "" {
-		name := treeNameByID(f, c.LastTopic)
-		if name != "" {
-			fmt.Fprintf(w, ", last=%s (%s)", c.LastTopic[:8], name)
-		} else {
-			fmt.Fprintf(w, ", last=%s", c.LastTopic[:8])
-		}
-	}
-	fmt.Fprintln(w)
-
 	return nil
 }
 
@@ -578,10 +496,9 @@ func slashHelp(w *os.File) error {
 	fmt.Fprintln(w, "=== Focus Gate Commands ===")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  /focus status          Compact context summary")
-	fmt.Fprintln(w, "  /focus inspect         Full state dump (forest, TF-IDF, guide, Markov)")
+	fmt.Fprintln(w, "  /focus inspect         Full state dump (forest, TF-IDF, guide)")
 	fmt.Fprintln(w, "  /focus tree [N]        Deep-dive into tree #N (list trees if N omitted)")
 	fmt.Fprintln(w, "  /focus terms [N]       TF-IDF vocabulary with IDF values (default: top 30)")
-	fmt.Fprintln(w, "  /focus markov          Transition matrix")
 	fmt.Fprintln(w, "  /focus score \"prompt\"  Dry-run classification scoring")
 	fmt.Fprintln(w, "  /focus health          System diagnostics and pruning forecast")
 	fmt.Fprintln(w, "  /focus help            This help message")

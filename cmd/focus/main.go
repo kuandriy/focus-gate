@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +13,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/markov"
 	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
@@ -23,25 +24,79 @@ type paths struct {
 	intentFile string
 	engineFile string
 	guideFile  string
-	markovFile string
 	configFile string
 }
 
+// resolveDataDir determines the state directory using this priority:
+//  1. --data-dir CLI flag (explicit override)
+//  2. FOCUS_GATE_DATA_DIR environment variable
+//  3. Per-project isolation: ~/.focus-gate/<sha256(cwd)[:12]>/
+//
+// Per-project isolation (option 3) prevents cross-contamination when the same
+// binary is used across multiple projects. Each working directory gets its own
+// state namespace under ~/.focus-gate/. Note: if a project directory is renamed
+// or moved, the hash changes and the old state directory becomes orphaned under
+// ~/.focus-gate/ — use --reset or delete the old slug directory manually.
+func resolveDataDir() string {
+	// 1. CLI flag
+	if dir := flagValue(os.Args, "--data-dir"); dir != "" {
+		return dir
+	}
+
+	// 2. Environment variable
+	if dir := os.Getenv("FOCUS_GATE_DATA_DIR"); dir != "" {
+		return dir
+	}
+
+	// 3. Per-project isolation based on CWD hash
+	cwd, err := os.Getwd()
+	if err != nil {
+		// Fallback: relative to binary (legacy behavior)
+		exe, _ := os.Executable()
+		return filepath.Join(filepath.Dir(exe), "data")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		exe, _ := os.Executable()
+		return filepath.Join(filepath.Dir(exe), "data")
+	}
+
+	h := sha256.Sum256([]byte(cwd))
+	slug := hex.EncodeToString(h[:])[:12]
+	return filepath.Join(home, ".focus-gate", slug)
+}
+
 func resolvePaths() paths {
+	dataDir := resolveDataDir()
+
+	// Config file lives alongside the binary (shared across projects).
 	exe, err := os.Executable()
 	if err != nil {
 		exe = "."
 	}
-	dir := filepath.Dir(exe)
-	dataDir := filepath.Join(dir, "data")
+	configFile := filepath.Join(filepath.Dir(exe), "config.json")
+
 	return paths{
 		dataDir:    dataDir,
 		intentFile: filepath.Join(dataDir, "intent.json"),
 		engineFile: filepath.Join(dataDir, "engine.json"),
 		guideFile:  filepath.Join(dataDir, "guide.json"),
-		markovFile: filepath.Join(dataDir, "markov.json"),
-		configFile: filepath.Join(dir, "config.json"),
+		configFile: configFile,
 	}
+}
+
+// flagValue returns the value of a --key=value or --key value flag.
+func flagValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, flag+"=") {
+			return a[len(flag)+1:]
+		}
+	}
+	return ""
 }
 
 // config matches the JSON config file structure.
@@ -52,22 +107,24 @@ type config struct {
 		Extend float64 `json:"extend"`
 		Branch float64 `json:"branch"`
 	} `json:"similarity"`
-	ContextLimit      int     `json:"contextLimit"`
-	BubbleUpTerms     int     `json:"bubbleUpTerms"`
-	MaxSourcesPerNode int     `json:"maxSourcesPerNode"`
-	GuideSize         int     `json:"guideSize"`
-	TransitionBoost   float64 `json:"transitionBoost"`
+	ContextLimit    int     `json:"contextLimit"`
+	BubbleUpTerms   int     `json:"bubbleUpTerms"`
+	MaxRefsPerNode  int     `json:"maxRefsPerNode"`
+	GuideSize       int     `json:"guideSize"`
+	SessionTimeout  float64 `json:"sessionTimeout"`  // hours; 0 = disabled
+	MergeSimilarity float64 `json:"mergeSimilarity"` // threshold for cluster merging; 0 = disabled
 }
 
 func defaultConfig() config {
 	c := config{
-		MemorySize:        100,
-		DecayRate:         0.05,
-		ContextLimit:      600,
-		BubbleUpTerms:     6,
-		MaxSourcesPerNode: 20,
-		GuideSize:         15,
-		TransitionBoost:   0.2,
+		MemorySize:      100,
+		DecayRate:       0.05,
+		ContextLimit:    600,
+		BubbleUpTerms:   6,
+		MaxRefsPerNode:  5,
+		GuideSize:       15,
+		SessionTimeout:  4.0, // 4 hours
+		MergeSimilarity: 0.7,
 	}
 	c.Similarity.Extend = 0.55
 	c.Similarity.Branch = 0.25
@@ -77,8 +134,8 @@ func defaultConfig() config {
 // loadConfig uses a two-phase JSON approach to distinguish "user set field to 0"
 // from "field absent" (should use default). Phase 1 loads a raw map to detect
 // which keys are present. Phase 2 loads the full struct. Only explicitly present
-// keys override defaults, so users can intentionally set transitionBoost=0 or
-// decayRate=0 without the value being silently replaced.
+// keys override defaults, so users can intentionally set decayRate=0 without
+// the value being silently replaced.
 func loadConfig(path string) config {
 	cfg := defaultConfig()
 
@@ -112,14 +169,17 @@ func loadConfig(path string) config {
 	if _, ok := raw["bubbleUpTerms"]; ok {
 		cfg.BubbleUpTerms = userCfg.BubbleUpTerms
 	}
-	if _, ok := raw["maxSourcesPerNode"]; ok {
-		cfg.MaxSourcesPerNode = userCfg.MaxSourcesPerNode
-	}
 	if _, ok := raw["guideSize"]; ok {
 		cfg.GuideSize = userCfg.GuideSize
 	}
-	if _, ok := raw["transitionBoost"]; ok {
-		cfg.TransitionBoost = userCfg.TransitionBoost
+	if _, ok := raw["maxRefsPerNode"]; ok {
+		cfg.MaxRefsPerNode = userCfg.MaxRefsPerNode
+	}
+	if _, ok := raw["sessionTimeout"]; ok {
+		cfg.SessionTimeout = userCfg.SessionTimeout
+	}
+	if _, ok := raw["mergeSimilarity"]; ok {
+		cfg.MergeSimilarity = userCfg.MergeSimilarity
 	}
 	// Handle nested "similarity" object.
 	if simRaw, ok := raw["similarity"]; ok {
@@ -161,8 +221,15 @@ func run() error {
 	p := resolvePaths()
 
 	// Recover .tmp files from interrupted saves before loading any state.
-	persist.RecoverTmpFiles(p.intentFile, p.engineFile, p.guideFile, p.markovFile)
+	persist.RecoverTmpFiles(p.intentFile, p.engineFile, p.guideFile)
 	cfg := loadConfig(p.configFile)
+
+	// --quiet suppresses stderr logging
+	if hasFlag(os.Args, "--quiet") {
+		if f, err := os.Open(os.DevNull); err == nil {
+			os.Stderr = f
+		}
+	}
 
 	// Parse CLI flags. --json is a modifier flag that can appear alongside
 	// --inspect or --dry-run to switch output from human-readable text to
@@ -198,7 +265,6 @@ func handleReset(p paths) error {
 	persist.Remove(p.intentFile)
 	persist.Remove(p.engineFile)
 	persist.Remove(p.guideFile)
-	persist.Remove(p.markovFile)
 	fmt.Fprint(os.Stdout, "[Focus] Reset complete. All tracking data cleared.\n")
 	return nil
 }
@@ -223,11 +289,8 @@ func handleStatus(p paths, cfg config) error {
 	g := guide.New(cfg.GuideSize)
 	logLoadErr("guide", persist.Load(p.guideFile, g))
 
-	c := markov.New()
-	logLoadErr("markov", persist.Load(p.markovFile, c))
-
 	gateCfg := toGateConfig(cfg)
-	gt := gate.NewWithChain(f, e, c, gateCfg)
+	gt := gate.New(f, e, gateCfg)
 	ctx := gt.GenerateContext()
 	if ctx != "" {
 		fmt.Fprint(os.Stdout, ctx)
@@ -280,9 +343,6 @@ func handlePrompt(p paths, cfg config) error {
 	g := guide.New(cfg.GuideSize)
 	logLoadErr("guide", persist.Load(p.guideFile, g))
 
-	c := markov.New()
-	logLoadErr("markov", persist.Load(p.markovFile, c))
-
 	// Update guide from transcript (if available)
 	if input.TranscriptPath != "" {
 		updateGuide(g, input.TranscriptPath, f)
@@ -290,7 +350,7 @@ func handlePrompt(p paths, cfg config) error {
 
 	// Process prompt
 	gateCfg := toGateConfig(cfg)
-	gt := gate.NewWithChain(f, e, c, gateCfg)
+	gt := gate.New(f, e, gateCfg)
 
 	// Reinforce the forest from new AI response summaries before classifying
 	// the incoming prompt, so tree scores reflect recent assistant activity.
@@ -317,9 +377,6 @@ func handlePrompt(p paths, cfg config) error {
 	}
 	if err := persist.SaveAtomic(p.guideFile, g); err != nil {
 		fmt.Fprintf(os.Stderr, "focus-gate: save guide: %v\n", err)
-	}
-	if err := persist.SaveAtomic(p.markovFile, c); err != nil {
-		fmt.Fprintf(os.Stderr, "focus-gate: save markov: %v\n", err)
 	}
 
 	// Output context to stdout
@@ -412,13 +469,14 @@ func updateGuide(g *guide.Guide, transcriptPath string, f *forest.Forest) {
 
 func toGateConfig(cfg config) gate.Config {
 	return gate.Config{
-		ExtendThreshold:   cfg.Similarity.Extend,
-		BranchThreshold:   cfg.Similarity.Branch,
-		BubbleUpTerms:     cfg.BubbleUpTerms,
-		MaxSourcesPerNode: cfg.MaxSourcesPerNode,
-		MemorySize:        cfg.MemorySize,
-		DecayRate:         cfg.DecayRate,
-		ContextLimit:      cfg.ContextLimit,
-		TransitionBoost:   cfg.TransitionBoost,
+		ExtendThreshold: cfg.Similarity.Extend,
+		BranchThreshold: cfg.Similarity.Branch,
+		BubbleUpTerms:   cfg.BubbleUpTerms,
+		MaxRefsPerNode:  cfg.MaxRefsPerNode,
+		MemorySize:      cfg.MemorySize,
+		DecayRate:       cfg.DecayRate,
+		ContextLimit:    cfg.ContextLimit,
+		SessionTimeout:  cfg.SessionTimeout,
+		MergeSimilarity: cfg.MergeSimilarity,
 	}
 }

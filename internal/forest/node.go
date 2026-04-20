@@ -17,7 +17,6 @@ type Node struct {
 	Frequency    int      `json:"frequency"`
 	Created      int64    `json:"created"`
 	LastAccessed int64    `json:"lastAccessed"`
-	Sources      []string `json:"sources"`
 	ChildIDs     []string `json:"childIds"`
 	ParentID     string   `json:"parentId,omitempty"`
 
@@ -27,15 +26,15 @@ type Node struct {
 	// RemoveDocument — calling it on non-indexed content would decrement document
 	// frequencies for terms that were never added, corrupting IDF over time.
 	Indexed bool `json:"indexed,omitempty"`
+
+	// Refs holds file paths extracted from the user prompt that created this node.
+	// Used to surface project files associated with each topic tree in context output.
+	Refs []string `json:"refs,omitempty"`
 }
 
 // NewNode creates a node with a unique ID and initial values.
 func NewNode(content string, depth int, source string) *Node {
 	now := time.Now().UnixMilli()
-	var sources []string
-	if source != "" {
-		sources = []string{source}
-	}
 	return &Node{
 		ID:           generateID(now),
 		Content:      content,
@@ -44,7 +43,6 @@ func NewNode(content string, depth int, source string) *Node {
 		Frequency:    1,
 		Created:      now,
 		LastAccessed: now,
-		Sources:      sources,
 	}
 }
 
@@ -68,16 +66,10 @@ func (n *Node) Score(now int64, decayRate float64) float64 {
 }
 
 // Touch increments the frequency and updates weight and last accessed time.
-func (n *Node) Touch(maxSources int, source string) {
+func (n *Node) Touch() {
 	n.Frequency++
 	n.Weight = math.Log2(float64(n.Frequency) + 1)
 	n.LastAccessed = time.Now().UnixMilli()
-	if source != "" && maxSources > 0 {
-		n.Sources = append(n.Sources, source)
-		if len(n.Sources) > maxSources {
-			n.Sources = n.Sources[len(n.Sources)-maxSources:]
-		}
-	}
 }
 
 // IsLeaf returns true if the node has no children.
