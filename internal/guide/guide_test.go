@@ -81,6 +81,32 @@ func TestGuideRenderEmpty(t *testing.T) {
 	}
 }
 
+func TestGuideAddSkipsNearDuplicate(t *testing.T) {
+	g := New(10)
+	g.Add("Implemented JWT auth with RS256 signing", "node1", nil)
+	g.Add("implemented  JWT  Auth  with  RS256  signing", "node1", nil)
+	g.Add("IMPLEMENTED JWT AUTH WITH RS256 SIGNING", "node1", nil)
+
+	if len(g.Entries) != 1 {
+		t.Errorf("near-duplicate summaries should collapse to one entry, got %d", len(g.Entries))
+	}
+}
+
+func TestGuideAddAllowsDuplicateOutsideWindow(t *testing.T) {
+	g := New(10)
+	g.Add("Implemented auth", "n1", nil)
+	g.Add("Fixed migration", "n2", nil)
+	g.Add("Added tests", "n3", nil)
+	g.Add("Refactored router", "n4", nil)
+	// "Implemented auth" is now outside the last dedupWindow (3) entries
+	// — should be accepted as a legitimate repeat.
+	g.Add("Implemented auth", "n1", nil)
+
+	if len(g.Entries) != 5 {
+		t.Errorf("entries = %d, want 5 (duplicate outside window should be allowed)", len(g.Entries))
+	}
+}
+
 func TestGuideRenderFormat(t *testing.T) {
 	g := New(5)
 	g.Add("did something", "", nil) // empty intentID = always shown

@@ -24,6 +24,10 @@ type Config struct {
 	ContextLimit    int     `json:"contextLimit"`
 	SessionTimeout  float64 `json:"sessionTimeout"`  // hours; 0 = disabled
 	MergeSimilarity float64 `json:"mergeSimilarity"` // threshold for cluster merging; 0 = disabled
+	// ProjectDir is the working directory used to validate extracted file
+	// refs. When non-empty, refs not present on disk relative to this dir
+	// are dropped before being stored on a node. Empty disables validation.
+	ProjectDir string `json:"-"`
 }
 
 // DefaultConfig returns sensible defaults.
@@ -37,7 +41,7 @@ func DefaultConfig() Config {
 		DecayRate:       0.05,
 		ContextLimit:    600,
 		SessionTimeout:  4.0,
-		MergeSimilarity: 0.7,
+		MergeSimilarity: 0.6,
 	}
 }
 
@@ -45,9 +49,11 @@ func DefaultConfig() Config {
 type Action int
 
 const (
-	ActionNew    Action = iota // Unrelated — start a new topic tree
-	ActionBranch               // Broadly related — add under root
-	ActionExtend               // Closely related — add near matching leaf
+	ActionNew      Action = iota // Unrelated — start a new topic tree
+	ActionBranch                 // Broadly related — add under root
+	ActionExtend                 // Closely related — add near matching leaf
+	ActionContinue               // Terse/unknown-vocabulary prompt — attach to last active tree
+	ActionSkip                   // Terse prompt with no tree to continue — drop silently
 )
 
 func (a Action) String() string {
@@ -58,6 +64,10 @@ func (a Action) String() string {
 		return "branch"
 	case ActionExtend:
 		return "extend"
+	case ActionContinue:
+		return "continue"
+	case ActionSkip:
+		return "skip"
 	}
 	return "unknown"
 }
@@ -83,11 +93,47 @@ type Gate struct {
 	// content changes (bubbleUp). The cache is transient — not persisted — because
 	// IDF weights shift as documents are added or removed between sessions.
 	vecCache map[string]tfidf.Vector
+
+	// lastCls is the classification produced by the most recent ProcessPrompt
+	// call. GenerateContext reads it via haveLastCls to annotate the injected
+	// header with the action taken ("extend"/"branch"/"new"/"continue"),
+	// giving the user an at-a-glance audit trail. Read-only paths
+	// (handleStatus, /focus status) leave haveLastCls=false and the tag is
+	// omitted from the header.
+	lastCls     Classification
+	haveLastCls bool
 }
 
 // New creates a Gate from existing forest and engine state.
 func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
 	return &Gate{Forest: f, Engine: e, Config: cfg, vecCache: make(map[string]tfidf.Vector)}
+}
+
+// recordClassification appends a log entry to the forest's ring buffer so
+// /focus last can surface recent classifications. A trimmed prompt snippet is
+// stored rather than the full text — the buffer is meant for quick triage, not
+// audit. Skips are included because they represent real hook firings the user
+// may want to understand ("why didn't that terse prompt get recorded?").
+func (g *Gate) recordClassification(cls Classification, prompt string) {
+	snippet := prompt
+	if len(snippet) > 80 {
+		snippet = snippet[:80] + "..."
+	}
+	treeID := ""
+	if cls.TreeIdx >= 0 && cls.TreeIdx < len(g.Forest.Trees) {
+		// For ActionNew the tree isn't in the forest yet; leave TreeID empty
+		// and let the viewer resolve the latest tree from ordering.
+		if cls.Action != ActionNew {
+			treeID = g.Forest.Trees[cls.TreeIdx].ID
+		}
+	}
+	g.Forest.RecordClassification(forest.ClassificationLog{
+		Action:    cls.Action.String(),
+		Score:     cls.Score,
+		TreeID:    treeID,
+		Prompt:    snippet,
+		Timestamp: time.Now().UnixMilli(),
+	})
 }
 
 // nodeVec returns the TF-IDF vector for a node, caching the result.
@@ -105,9 +151,6 @@ func (g *Gate) nodeVec(nodeID string, content string) tfidf.Vector {
 // ProcessPrompt classifies a prompt, applies it to the forest, and returns context.
 func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	tokens := text.Tokenize(prompt)
-	if len(tokens) == 0 {
-		return ""
-	}
 
 	// Session boundary detection: if the gap since last prompt exceeds the
 	// timeout, penalize all existing tree scores so stale context doesn't
@@ -117,18 +160,49 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 
 	vec := g.Engine.VectorizeTokens(tokens)
 
-	cls := g.classify(vec)
+	// Decide the action. Terse prompts (short and/or missing IDF signal) are
+	// routed to ActionContinue/ActionSkip before calling the pure classifier,
+	// so classify() only ever sees inputs that warrant real scoring.
+	var cls Classification
+	if isTerse(tokens, vec) {
+		if len(g.Forest.Trees) == 0 {
+			cls = Classification{Action: ActionSkip}
+		} else {
+			cls = Classification{
+				Action:  ActionContinue,
+				TreeIdx: lastActiveTreeIndex(g.Forest),
+			}
+		}
+	} else {
+		cls = g.classify(vec)
+	}
+
+	// Record the classification before any early return so /focus last reflects
+	// every real hook firing, including skips.
+	g.recordClassification(cls, prompt)
+	g.lastCls = cls
+	g.haveLastCls = true
+
+	if cls.Action == ActionSkip {
+		return ""
+	}
+
 	g.apply(cls, prompt, source, tokens)
 
 	g.Forest.Meta.TotalPrompts++
-	g.Forest.Meta.LastUpdate = g.Forest.Trees[len(g.Forest.Trees)-1].LastAccessed
+	g.Forest.Meta.LastUpdate = time.Now().UnixMilli()
 
-	// Add the new prompt to the TF-IDF corpus
-	g.Engine.AddDocument(tokens)
-
-	// Reset vector cache — AddDocument shifts IDF globally (TotalDocs increased),
-	// so all previously cached vectors are stale.
-	g.vecCache = make(map[string]tfidf.Vector)
+	// Continuation leaves carry terse/novel tokens that would distort IDF
+	// (inflating DF for throwaway terms like "fix"/"yes"). Keep them out of
+	// the corpus so the next identical terse prompt still vectorizes to nil
+	// and falls through to continuation, rather than matching the previous
+	// continuation node via a weakly-weighted term.
+	if cls.Action != ActionContinue {
+		g.Engine.AddDocument(tokens)
+		// Reset vector cache — AddDocument shifts IDF globally, so all
+		// previously cached vectors are stale.
+		g.vecCache = make(map[string]tfidf.Vector)
+	}
 
 	// Prune if needed
 	if g.Forest.NodeCount() > g.Config.MemorySize {
@@ -140,7 +214,10 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 
 	// Cluster merging: after classification and pruning, check for trees that
 	// have drifted toward the same topic and merge the smaller into the larger.
-	g.tryMerge()
+	// Skip after a continuation — no new semantic signal to justify merging.
+	if cls.Action != ActionContinue {
+		g.tryMerge()
+	}
 
 	return g.GenerateContext()
 }
@@ -153,6 +230,11 @@ func (g *Gate) classify(vec tfidf.Vector) Classification {
 
 // classifyDetailed compares the prompt vector against all tree roots and leaves.
 // When detailed is true, per-tree scoring data is returned for dry-run diagnostics.
+//
+// This function is deliberately pure: it maps (vec, forest) onto an
+// {extend, branch, new} decision. The ActionContinue / ActionSkip paths
+// (terse prompts, empty forests) live one level up in ProcessPrompt, so
+// DryRun and any future read-only caller get consistent scoring numbers.
 func (g *Gate) classifyDetailed(vec tfidf.Vector, detailed bool) (Classification, []TreeScore) {
 	if len(g.Forest.Trees) == 0 || vec == nil {
 		return Classification{Action: ActionNew, Score: 0}, nil
@@ -223,9 +305,30 @@ func (g *Gate) classifyDetailed(vec tfidf.Vector, detailed bool) (Classification
 
 // apply mutates the forest based on the classification.
 func (g *Gate) apply(cls Classification, content string, source string, tokens []string) {
-	refs := text.ExtractFilePaths(content, g.Config.MaxRefsPerNode)
+	refs := text.FilterExistingPaths(
+		g.Config.ProjectDir,
+		text.ExtractFilePaths(content, g.Config.MaxRefsPerNode),
+	)
 
 	switch cls.Action {
+	case ActionSkip:
+		// Terse prompt and the forest is empty — nothing to attach to.
+		return
+
+	case ActionContinue:
+		// Terse/unknown-vocabulary prompt. Attach as a leaf under the last
+		// active tree's root so follow-up AI context stays grounded in what
+		// the user was just working on. The node is intentionally not indexed
+		// in TF-IDF (it has no meaningful terms) and bubble-up is skipped
+		// (it would contribute nothing to the parent abstraction).
+		tree := g.Forest.Trees[cls.TreeIdx]
+		g.preserveRoot(tree)
+		child := tree.AddChild(tree.RootID, content, source)
+		if child != nil {
+			child.Indexed = false
+			child.Refs = refs
+		}
+
 	case ActionNew:
 		tree := forest.NewTree(content, source)
 		tree.Root().Indexed = true // real user prompt — register in TF-IDF
@@ -268,6 +371,41 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 		}
 		g.bubbleUp(tree, tree.RootID)
 	}
+}
+
+// terseTokenThreshold is the maximum post-tokenization length for which a
+// prompt with no IDF signal is treated as a continuation rather than a new
+// tree. Prompts like "fix", "yes", "run it" tokenize to 1-2 tokens; longer
+// prompts with nil vec (e.g. a fresh 5-word topic whose vocabulary the corpus
+// has not seen yet) are genuine new topics and should fall through to the
+// normal classifier.
+const terseTokenThreshold = 2
+
+// isTerse returns true when the prompt lacks enough signal to warrant a new
+// tree: either empty tokens (pure stop-words / blank text) or a very short
+// prompt that produces no IDF vector. Longer prompts with nil vec signal a
+// genuinely new topic — they are classified normally and land as ActionNew
+// via the standard path.
+func isTerse(tokens []string, vec tfidf.Vector) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	return vec == nil && len(tokens) <= terseTokenThreshold
+}
+
+// lastActiveTreeIndex returns the index of the tree with the most recent
+// LastAccessed timestamp. Ties break by slice order (earliest wins). Assumes
+// len(Forest.Trees) > 0; the caller must check.
+func lastActiveTreeIndex(f *forest.Forest) int {
+	best := 0
+	bestTs := f.Trees[0].LastAccessed
+	for i, tree := range f.Trees {
+		if tree.LastAccessed > bestTs {
+			bestTs = tree.LastAccessed
+			best = i
+		}
+	}
+	return best
 }
 
 // preserveRoot handles the root preservation edge case: when a single-node tree
@@ -405,12 +543,26 @@ func (g *Gate) GenerateContext() string {
 		return scored[i].score > scored[j].score
 	})
 
-	// Pre-compute header and footer
-	header := fmt.Sprintf("[Focus | %d prompts | %d/%d mem | %d trees]\n",
+	// Pre-compute header and footer. When a classification has just been
+	// produced (ProcessPrompt path), tag the header with "<action> <score>"
+	// so the user gets a one-glance audit trail of how the last prompt landed.
+	// Read-only paths (handleStatus, /focus status) leave haveLastCls=false
+	// and the tag is omitted from the header.
+	actionTag := ""
+	if g.haveLastCls {
+		switch g.lastCls.Action {
+		case ActionExtend, ActionBranch:
+			actionTag = fmt.Sprintf(" | %s %.2f", g.lastCls.Action, g.lastCls.Score)
+		case ActionNew, ActionContinue, ActionSkip:
+			actionTag = fmt.Sprintf(" | %s", g.lastCls.Action)
+		}
+	}
+	header := fmt.Sprintf("[Focus | %d prompts | %d/%d mem | %d trees%s]\n",
 		g.Forest.Meta.TotalPrompts,
 		g.Forest.NodeCount(),
 		g.Config.MemorySize,
-		len(g.Forest.Trees))
+		len(g.Forest.Trees),
+		actionTag)
 	footer := "[/Focus]\n"
 
 	remaining := budget - len(header) - len(footer)

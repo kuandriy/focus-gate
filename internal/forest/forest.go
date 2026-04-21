@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// SchemaVersion is the on-disk schema version for intent.json. Bump this
+// whenever the Forest/Tree/Node JSON layout changes in a way older binaries
+// cannot read safely; LoadVersioned will reject mismatched files.
+const SchemaVersion = "1"
+
 // Meta holds forest-level metadata.
 type Meta struct {
 	TotalPrompts int   `json:"totalPrompts"`
@@ -12,16 +17,49 @@ type Meta struct {
 	LastUpdate   int64 `json:"lastUpdate"`
 }
 
+// ClassificationLog is a compact record of one ProcessPrompt call. Forest keeps
+// a ring buffer of these so /focus last can answer "what happened on recent
+// prompts?" without re-running classification. Populated by Gate after each
+// prompt, cleared only on --reset.
+type ClassificationLog struct {
+	Action    string  `json:"action"`           // "new" / "branch" / "extend" / "continue" / "skip"
+	Score     float64 `json:"score"`            // Top cosine similarity (0 for continue/skip)
+	TreeID    string  `json:"treeId,omitempty"` // Target tree; empty for ActionNew (tree is freshly created)
+	Prompt    string  `json:"prompt"`           // First ~80 chars of the user prompt
+	Timestamp int64   `json:"timestamp"`
+}
+
+// classificationLogCapacity bounds the ring buffer. Keep small — the purpose
+// is quick triage of recent prompts, not a durable audit trail.
+const classificationLogCapacity = 10
+
 // Forest is a collection of topic trees with scoring, pruning, and metadata.
 type Forest struct {
-	Trees []*Tree `json:"trees"`
-	Meta  Meta    `json:"meta"`
+	// Schema is first so it appears at the top of the serialized JSON file,
+	// making the version easy to spot when inspecting state manually.
+	Schema string              `json:"schemaVersion"`
+	Trees  []*Tree             `json:"trees"`
+	Meta   Meta                `json:"meta"`
+	Recent []ClassificationLog `json:"recent,omitempty"`
 }
+
+// RecordClassification appends a log entry and trims the buffer to capacity.
+func (f *Forest) RecordClassification(log ClassificationLog) {
+	f.Recent = append(f.Recent, log)
+	if len(f.Recent) > classificationLogCapacity {
+		f.Recent = f.Recent[len(f.Recent)-classificationLogCapacity:]
+	}
+}
+
+// SetSchemaVersion implements persist.SchemaVersioner. Loaders call this to
+// stamp the current version onto legacy files after a successful unmarshal.
+func (f *Forest) SetSchemaVersion(v string) { f.Schema = v }
 
 // NewForest creates an empty forest.
 func NewForest() *Forest {
 	now := time.Now().UnixMilli()
 	return &Forest{
+		Schema: SchemaVersion,
 		Meta: Meta{
 			Created:    now,
 			LastUpdate: now,

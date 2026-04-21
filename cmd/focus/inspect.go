@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"time"
@@ -10,7 +11,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
@@ -39,19 +39,14 @@ func hasFlag(args []string, flag string) bool {
 // verify at a glance whether the system is tracking intent correctly after a
 // series of prompts.
 func handleInspect(p paths, cfg config, asJSON bool) error {
-	f := forest.NewForest()
-	logLoadErr("intent", persist.Load(p.intentFile, f))
-
-	e := tfidf.NewEngine()
-	logLoadErr("engine", persist.Load(p.engineFile, e))
-
-	g := guide.New(cfg.GuideSize)
-	logLoadErr("guide", persist.Load(p.guideFile, g))
+	f := loadForest(p.intentFile)
+	e := loadEngine(p.engineFile)
+	g := loadGuide(p.guideFile, cfg.GuideSize)
 
 	if asJSON {
 		return inspectJSON(f, e, g, cfg)
 	}
-	return inspectText(f, e, g, cfg)
+	return inspectText(os.Stdout, f, e, g, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,14 +58,9 @@ func handleInspect(p paths, cfg config, asJSON bool) error {
 // score each tree. Useful for understanding why a prompt was classified a
 // certain way or testing threshold tuning.
 func handleDryRun(p paths, cfg config, prompt string, asJSON bool) error {
-	f := forest.NewForest()
-	logLoadErr("intent", persist.Load(p.intentFile, f))
-
-	e := tfidf.NewEngine()
-	logLoadErr("engine", persist.Load(p.engineFile, e))
-
-	g := guide.New(cfg.GuideSize)
-	logLoadErr("guide", persist.Load(p.guideFile, g))
+	f := loadForest(p.intentFile)
+	e := loadEngine(p.engineFile)
+	_ = loadGuide(p.guideFile, cfg.GuideSize)
 
 	// Clean the prompt the same way the hook path does.
 	prompt = text.CleanPrompt(prompt)
@@ -91,8 +81,7 @@ func handleDryRun(p paths, cfg config, prompt string, asJSON bool) error {
 // Text formatters
 // ---------------------------------------------------------------------------
 
-func inspectText(f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
-	w := os.Stdout
+func inspectText(w io.Writer, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
 	now := time.Now().UnixMilli()
 
 	fmt.Fprintln(w, "=== Focus Gate Inspect ===")
@@ -226,6 +215,16 @@ func dryRunText(result gate.DryRunResult, cfg config) error {
 		fmt.Fprintf(w, "  Would add as new subtopic under root of Tree #%d.\n", result.BestTree)
 	case "extend":
 		fmt.Fprintf(w, "  Would add as sibling near leaf %s in Tree #%d.\n", result.BestLeaf, result.BestTree)
+
+	}
+
+	if result.NearMiss {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Near-miss: top score %.4f fell short of branch threshold %.3f.\n",
+			result.BestScore, result.NearMissThreshold)
+		fmt.Fprintln(w, "  A typo, missing stem, or rare-term mismatch may have prevented a match")
+		fmt.Fprintln(w, "  you were expecting. Check /focus tree N to see the tree's vector terms.")
+		return nil
 	}
 
 	return nil
@@ -391,7 +390,7 @@ func dryRunJSON(result gate.DryRunResult) error {
 // writeNodeTree recursively prints a tree's node hierarchy with box-drawing
 // connectors. isRoot controls whether the node metadata is printed (children
 // are always printed by their parent's iteration).
-func writeNodeTree(w *os.File, tree *forest.Tree, nodeID string, prefix string, now int64, decayRate float64, isRoot bool) {
+func writeNodeTree(w io.Writer, tree *forest.Tree, nodeID string, prefix string, now int64, decayRate float64, isRoot bool) {
 	node := tree.Nodes[nodeID]
 	if node == nil {
 		return

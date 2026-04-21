@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
@@ -24,6 +26,7 @@ type paths struct {
 	intentFile string
 	engineFile string
 	guideFile  string
+	lockFile   string
 	configFile string
 }
 
@@ -70,20 +73,40 @@ func resolveDataDir() string {
 func resolvePaths() paths {
 	dataDir := resolveDataDir()
 
-	// Config file lives alongside the binary (shared across projects).
-	exe, err := os.Executable()
-	if err != nil {
-		exe = "."
-	}
-	configFile := filepath.Join(filepath.Dir(exe), "config.json")
-
 	return paths{
 		dataDir:    dataDir,
 		intentFile: filepath.Join(dataDir, "intent.json"),
 		engineFile: filepath.Join(dataDir, "engine.json"),
 		guideFile:  filepath.Join(dataDir, "guide.json"),
-		configFile: configFile,
+		lockFile:   filepath.Join(dataDir, ".lock"),
+		configFile: resolveConfigFile(),
 	}
+}
+
+// resolveConfigFile picks the configuration file to load, in priority order:
+//  1. ./.focus-gate.json — per-project override (current working directory).
+//  2. $FOCUS_GATE_CONFIG — explicit path, useful for CI or non-standard layouts.
+//  3. config.json alongside the binary — global fallback shared across projects.
+//
+// The first path that exists on disk wins. If none exist, we return the global
+// path anyway so a missing-file Load silently yields defaults (same as before).
+func resolveConfigFile() string {
+	if cwd, err := os.Getwd(); err == nil {
+		projectCfg := filepath.Join(cwd, ".focus-gate.json")
+		if _, err := os.Stat(projectCfg); err == nil {
+			return projectCfg
+		}
+	}
+
+	if envCfg := os.Getenv("FOCUS_GATE_CONFIG"); envCfg != "" {
+		return envCfg
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "."
+	}
+	return filepath.Join(filepath.Dir(exe), "config.json")
 }
 
 // flagValue returns the value of a --key=value or --key value flag.
@@ -124,7 +147,7 @@ func defaultConfig() config {
 		MaxRefsPerNode:  5,
 		GuideSize:       15,
 		SessionTimeout:  4.0, // 4 hours
-		MergeSimilarity: 0.7,
+		MergeSimilarity: 0.6,
 	}
 	c.Similarity.Extend = 0.55
 	c.Similarity.Branch = 0.25
@@ -240,6 +263,8 @@ func run() error {
 		switch os.Args[1] {
 		case "--reset":
 			return handleReset(p)
+		case "--list-projects":
+			return handleListProjects()
 		case "--status":
 			return handleStatus(p, cfg)
 		case "--inspect":
@@ -254,6 +279,18 @@ func run() error {
 				return fmt.Errorf("usage: focus --dry-run \"prompt text\" [--json]")
 			}
 			return handleDryRun(p, cfg, prompt, jsonOutput)
+		case "--cmd":
+			// Slash command mode for custom Claude Code slash commands.
+			// Writes to stdout and exits 0 so output can be captured cleanly.
+			sub := ""
+			arg := ""
+			if len(os.Args) > 2 {
+				sub = os.Args[2]
+			}
+			if len(os.Args) > 3 {
+				arg = strings.Join(os.Args[3:], " ")
+			}
+			return handleSlashCommand(slashCommand{sub: sub, arg: arg}, p, cfg, os.Stdout)
 		}
 	}
 
@@ -269,6 +306,100 @@ func handleReset(p paths) error {
 	return nil
 }
 
+// handleListProjects scans ~/.focus-gate/ and prints one row per per-project
+// data directory, showing the sha256 slug, total size on disk, and last
+// modification time. This is the discovery tool for orphaned state left
+// behind when a project directory gets renamed or moved — the slug changes
+// and the old data becomes invisible to --status/--inspect, but is still
+// sitting on disk.
+func handleListProjects() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("user home: %w", err)
+	}
+	root := filepath.Join(home, ".focus-gate")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(os.Stdout, "[Focus] No project data found — ~/.focus-gate/ does not exist yet.")
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", root, err)
+	}
+
+	type projectRow struct {
+		slug    string
+		size    int64
+		modTime int64
+	}
+	var rows []projectRow
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		info, err := os.Stat(dir)
+		if err != nil {
+			continue
+		}
+		size := dirSize(dir)
+		rows = append(rows, projectRow{
+			slug:    e.Name(),
+			size:    size,
+			modTime: info.ModTime().UnixMilli(),
+		})
+	}
+
+	if len(rows) == 0 {
+		fmt.Fprintln(os.Stdout, "[Focus] No project data directories under ~/.focus-gate/.")
+		return nil
+	}
+
+	// Newest first so currently-active projects are at the top.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].modTime > rows[j].modTime })
+
+	fmt.Fprintln(os.Stdout, "[Focus] Known project data directories:")
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintf(os.Stdout, "  %-14s %10s  %s\n", "SLUG", "SIZE", "LAST MODIFIED")
+	for _, r := range rows {
+		fmt.Fprintf(os.Stdout, "  %-14s %10s  %s\n",
+			r.slug,
+			humanSize(r.size),
+			time.UnixMilli(r.modTime).Format("2006-01-02 15:04:05"),
+		)
+	}
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "Slugs are sha256(cwd)[:12]. If a project was renamed, its old slug")
+	fmt.Fprintln(os.Stdout, "will appear here but never be touched again — remove with:")
+	fmt.Fprintln(os.Stdout, "  rm -rf ~/.focus-gate/<slug>")
+	return nil
+}
+
+// dirSize returns the total size of all regular files under dir. Returns 0 on
+// any error; used only for display so best-effort is fine.
+func dirSize(dir string) int64 {
+	var total int64
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// humanSize formats a byte count as KB/MB with one decimal.
+func humanSize(b int64) string {
+	switch {
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	}
+}
+
 // logLoadErr logs non-nil persist.Load errors to stderr. Errors are logged
 // rather than returned because a corrupt file should not block the user's
 // prompt — the system continues with empty/default state and the user can
@@ -279,15 +410,33 @@ func logLoadErr(name string, err error) {
 	}
 }
 
-func handleStatus(p paths, cfg config) error {
+// loadForest returns a forest loaded from disk with schema-version guarding.
+// On error (missing file, corrupt data, or version mismatch) the returned
+// forest is empty and the error is logged to stderr, never blocking the user.
+func loadForest(path string) *forest.Forest {
 	f := forest.NewForest()
-	logLoadErr("intent", persist.Load(p.intentFile, f))
+	logLoadErr("intent", persist.LoadVersioned(path, f, forest.SchemaVersion))
+	return f
+}
 
+// loadEngine mirrors loadForest for the TF-IDF engine state.
+func loadEngine(path string) *tfidf.Engine {
 	e := tfidf.NewEngine()
-	logLoadErr("engine", persist.Load(p.engineFile, e))
+	logLoadErr("engine", persist.LoadVersioned(path, e, tfidf.SchemaVersion))
+	return e
+}
 
-	g := guide.New(cfg.GuideSize)
-	logLoadErr("guide", persist.Load(p.guideFile, g))
+// loadGuide mirrors loadForest for the guide state.
+func loadGuide(path string, maxSize int) *guide.Guide {
+	g := guide.New(maxSize)
+	logLoadErr("guide", persist.LoadVersioned(path, g, guide.SchemaVersion))
+	return g
+}
+
+func handleStatus(p paths, cfg config) error {
+	f := loadForest(p.intentFile)
+	e := loadEngine(p.engineFile)
+	g := loadGuide(p.guideFile, cfg.GuideSize)
 
 	gateCfg := toGateConfig(cfg)
 	gt := gate.New(f, e, gateCfg)
@@ -327,21 +476,49 @@ func handlePrompt(p paths, cfg config) error {
 		return nil
 	}
 
-	// Slash command intercept — /focus <subcommand> runs an inspector
-	// and returns early without modifying any persisted state.
+	// Slash command intercept — /focus or fg: runs the inspector.
+	//
+	// The raw hook-output context block is rendered reliably in the
+	// Claude Code CLI but may be hidden from the user in the VSCode
+	// extension (the extension shows hooks to the model, not to the user).
+	// So we wrap the inspector output with a short instruction telling
+	// the model to echo it back verbatim. The model's reply then appears
+	// in the visible chat regardless of which UI the user is on.
+	//
+	// Exit 0 lets the user's literal "fg: status" text still reach the
+	// model; the wrapper makes the model's response the inspector output
+	// itself, not a conversational reply to "fg: status". The classifier
+	// never runs because os.Exit halts main below.
 	if cmd, ok := parseSlashCommand(input.Prompt); ok {
-		return handleSlashCommand(cmd, p, cfg)
+		var buf strings.Builder
+		if err := handleSlashCommand(cmd, p, cfg, &buf); err != nil {
+			fmt.Fprintf(os.Stderr, "focus-gate: %v\n", err)
+		}
+		fmt.Fprintln(os.Stdout, "[focus-gate]: The user invoked a focus-gate inspector command. Reply with EXACTLY the fenced block below, and nothing else — no preamble, no commentary.")
+		fmt.Fprintln(os.Stdout)
+		fmt.Fprintln(os.Stdout, "```")
+		fmt.Fprint(os.Stdout, buf.String())
+		fmt.Fprintln(os.Stdout, "```")
+		os.Exit(0)
 	}
 
+	// Serialize concurrent UserPromptSubmit hooks on the same project. The
+	// lock is held across load → mutate → save so two simultaneous prompts
+	// cannot race on state files and silently drop one another's updates.
+	lock, err := persist.Acquire(p.lockFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "focus-gate: acquire lock: %v\n", err)
+	}
+	defer func() {
+		if lock != nil {
+			_ = lock.Release()
+		}
+	}()
+
 	// Load persisted state
-	f := forest.NewForest()
-	logLoadErr("intent", persist.Load(p.intentFile, f))
-
-	e := tfidf.NewEngine()
-	logLoadErr("engine", persist.Load(p.engineFile, e))
-
-	g := guide.New(cfg.GuideSize)
-	logLoadErr("guide", persist.Load(p.guideFile, g))
+	f := loadForest(p.intentFile)
+	e := loadEngine(p.engineFile)
+	g := loadGuide(p.guideFile, cfg.GuideSize)
 
 	// Update guide from transcript (if available)
 	if input.TranscriptPath != "" {
@@ -468,6 +645,11 @@ func updateGuide(g *guide.Guide, transcriptPath string, f *forest.Forest) {
 }
 
 func toGateConfig(cfg config) gate.Config {
+	// Use the current working directory as the base for file-ref validation.
+	// In hook mode, Claude Code runs this binary from the project root, which
+	// is exactly what we want. If Getwd fails (e.g. the dir was deleted out
+	// from under us), fall back to empty — validation then becomes a no-op.
+	projectDir, _ := os.Getwd()
 	return gate.Config{
 		ExtendThreshold: cfg.Similarity.Extend,
 		BranchThreshold: cfg.Similarity.Branch,
@@ -478,5 +660,6 @@ func toGateConfig(cfg config) gate.Config {
 		ContextLimit:    cfg.ContextLimit,
 		SessionTimeout:  cfg.SessionTimeout,
 		MergeSimilarity: cfg.MergeSimilarity,
+		ProjectDir:      projectDir,
 	}
 }

@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"math"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,7 +12,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
-	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
@@ -23,57 +22,72 @@ type slashCommand struct {
 	arg string // e.g. tree index/ID, or prompt text for score
 }
 
-// parseSlashCommand checks whether the raw (uncleaned) prompt starts with
-// "/focus" and extracts the subcommand and optional argument.
-// Returns (cmd, true) if matched, (zero, false) otherwise.
+// commandPrefixes are the recognised triggers that route a prompt through the
+// inspector instead of normal classification:
+//   - "/focus" — the conventional form, works in the Claude Code CLI.
+//   - "fg:"    — short non-slash alias for environments like the VSCode
+//     extension where a leading "/" is intercepted by the slash-command
+//     picker before the hook can see it. Deliberately short so it's cheap
+//     to type; "fg" is distinctive enough to never collide with English
+//     prose as a sentence opener.
+var commandPrefixes = []string{"/focus", "fg:"}
+
+// parseSlashCommand checks whether the raw (uncleaned) prompt begins with one
+// of the recognised command prefixes and, if so, extracts the subcommand and
+// optional argument. Returns (cmd, true) on match, zero value otherwise.
+//
+// Matching rules:
+//   - Leading whitespace is trimmed.
+//   - Case-insensitive on the prefix itself ("/FOCUS", "Focus:" both match).
+//   - After the prefix we require either end-of-string or whitespace, so
+//     "focus:foo" matches (treated as sub "foo", no space needed after ":" or
+//     "!") but "/focusgate" does not match the "/focus" prefix.
 func parseSlashCommand(raw string) (slashCommand, bool) {
 	trimmed := strings.TrimSpace(raw)
 	lower := strings.ToLower(trimmed)
 
-	if !strings.HasPrefix(lower, "/focus") {
-		return slashCommand{}, false
+	for _, prefix := range commandPrefixes {
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		// For the "/focus" form we require a word boundary (space) after the
+		// prefix to avoid matching "/focusgate". The "focus:" and "focus!"
+		// forms already self-delimit with their trailing punctuation, so no
+		// extra boundary check is needed.
+		if prefix == "/focus" {
+			if len(lower) > len(prefix) && lower[len(prefix)] != ' ' {
+				return slashCommand{}, false
+			}
+		}
+
+		rest := strings.TrimSpace(trimmed[len(prefix):])
+		if rest == "" {
+			return slashCommand{sub: "help"}, true
+		}
+
+		parts := strings.SplitN(rest, " ", 2)
+		sub := strings.ToLower(parts[0])
+		arg := ""
+		if len(parts) > 1 {
+			arg = strings.TrimSpace(parts[1])
+		}
+		return slashCommand{sub: sub, arg: arg}, true
 	}
 
-	// Ensure "/focus" is the complete word — not a prefix of "/focusgate" etc.
-	if len(lower) > len("/focus") && lower[len("/focus")] != ' ' {
-		return slashCommand{}, false
-	}
-
-	// Strip the "/focus" prefix and parse the rest.
-	rest := strings.TrimSpace(trimmed[len("/focus"):])
-	if rest == "" {
-		return slashCommand{sub: "help"}, true
-	}
-
-	// Split into subcommand and argument.
-	parts := strings.SplitN(rest, " ", 2)
-	sub := strings.ToLower(parts[0])
-	arg := ""
-	if len(parts) > 1 {
-		arg = strings.TrimSpace(parts[1])
-	}
-
-	return slashCommand{sub: sub, arg: arg}, true
+	return slashCommand{}, false
 }
 
 // handleSlashCommand dispatches a parsed slash command to the appropriate handler.
 // All commands load state read-only — no mutations, no saves.
-func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
+func handleSlashCommand(cmd slashCommand, p paths, cfg config, w io.Writer) error {
 	// Load all state (read-only)
-	f := forest.NewForest()
-	logLoadErr("intent", persist.Load(p.intentFile, f))
-
-	e := tfidf.NewEngine()
-	logLoadErr("engine", persist.Load(p.engineFile, e))
-
-	g := guide.New(cfg.GuideSize)
-	logLoadErr("guide", persist.Load(p.guideFile, g))
-
-	w := os.Stdout
+	f := loadForest(p.intentFile)
+	e := loadEngine(p.engineFile)
+	g := loadGuide(p.guideFile, cfg.GuideSize)
 
 	switch cmd.sub {
 	case "inspect":
-		return inspectText(f, e, g, cfg)
+		return inspectText(w, f, e, g, cfg)
 
 	case "status":
 		return slashStatus(w, f, e, g, cfg)
@@ -86,6 +100,9 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
 
 	case "score":
 		return slashScore(w, f, e, cfg, cmd.arg)
+
+	case "last":
+		return slashLast(w, f)
 
 	case "health":
 		return slashHealth(w, f, e, cfg)
@@ -102,7 +119,7 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config) error {
 // ---------------------------------------------------------------------------
 // /focus status — compact summary (same as --status but in chat)
 // ---------------------------------------------------------------------------
-func slashStatus(w *os.File, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
+func slashStatus(w io.Writer, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, cfg config) error {
 	gateCfg := toGateConfig(cfg)
 	gt := gate.New(f, e, gateCfg)
 	ctx := gt.GenerateContext()
@@ -123,7 +140,7 @@ func slashStatus(w *os.File, f *forest.Forest, e *tfidf.Engine, g *guide.Guide, 
 // ---------------------------------------------------------------------------
 // /focus tree <index|id> — single tree deep-dive
 // ---------------------------------------------------------------------------
-func slashTree(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config, arg string) error {
+func slashTree(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg string) error {
 	if len(f.Trees) == 0 {
 		fmt.Fprintln(w, "[Focus] No trees in forest.")
 		return nil
@@ -240,7 +257,7 @@ func slashTree(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config, arg st
 // ---------------------------------------------------------------------------
 // /focus terms [N] — TF-IDF vocabulary with IDF values
 // ---------------------------------------------------------------------------
-func slashTerms(w *os.File, e *tfidf.Engine, arg string) error {
+func slashTerms(w io.Writer, e *tfidf.Engine, arg string) error {
 	n := 30
 	if arg != "" {
 		if parsed, err := strconv.Atoi(arg); err == nil && parsed > 0 {
@@ -269,7 +286,7 @@ func slashTerms(w *os.File, e *tfidf.Engine, arg string) error {
 // ---------------------------------------------------------------------------
 // /focus score "prompt" — dry-run scoring from chat
 // ---------------------------------------------------------------------------
-func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config, arg string) error {
+func slashScore(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg string) error {
 	if arg == "" {
 		fmt.Fprintln(w, "[Focus] Usage: /focus score <prompt text>")
 		return nil
@@ -330,7 +347,7 @@ func slashScore(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config, arg s
 // ---------------------------------------------------------------------------
 // /focus health — system diagnostics
 // ---------------------------------------------------------------------------
-func slashHealth(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config) error {
+func slashHealth(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config) error {
 	now := time.Now().UnixMilli()
 
 	fmt.Fprintln(w, "=== Focus Health ===")
@@ -490,9 +507,47 @@ func slashHealth(w *os.File, f *forest.Forest, e *tfidf.Engine, cfg config) erro
 }
 
 // ---------------------------------------------------------------------------
+// /focus last — recent classifications
+// ---------------------------------------------------------------------------
+func slashLast(w io.Writer, f *forest.Forest) error {
+	if len(f.Recent) == 0 {
+		fmt.Fprintln(w, "[Focus] No classifications recorded yet — send a prompt first.")
+		return nil
+	}
+	fmt.Fprintln(w, "=== Recent Classifications ===")
+	// Render most-recent first so the user sees their latest prompt at top.
+	for i := len(f.Recent) - 1; i >= 0; i-- {
+		log := f.Recent[i]
+		treeLabel := "—"
+		if log.TreeID != "" {
+			treeLabel = treeNameByID(f, log.TreeID)
+			if treeLabel == "" {
+				treeLabel = "(pruned)"
+			}
+		}
+		fmt.Fprintf(w, "  #%-2d %-8s %.3f  %-40s  -> %s\n",
+			len(f.Recent)-i,
+			log.Action,
+			log.Score,
+			truncate(log.Prompt, 40),
+			treeLabel,
+		)
+	}
+	return nil
+}
+
+// truncate returns s limited to n runes with an ellipsis suffix when truncated.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+// ---------------------------------------------------------------------------
 // /focus help — list available commands
 // ---------------------------------------------------------------------------
-func slashHelp(w *os.File) error {
+func slashHelp(w io.Writer) error {
 	fmt.Fprintln(w, "=== Focus Gate Commands ===")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  /focus status          Compact context summary")
@@ -500,8 +555,12 @@ func slashHelp(w *os.File) error {
 	fmt.Fprintln(w, "  /focus tree [N]        Deep-dive into tree #N (list trees if N omitted)")
 	fmt.Fprintln(w, "  /focus terms [N]       TF-IDF vocabulary with IDF values (default: top 30)")
 	fmt.Fprintln(w, "  /focus score \"prompt\"  Dry-run classification scoring")
+	fmt.Fprintln(w, "  /focus last            Recent classifications (action + score)")
 	fmt.Fprintln(w, "  /focus health          System diagnostics and pruning forecast")
 	fmt.Fprintln(w, "  /focus help            This help message")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Short alias for environments where '/' is intercepted")
+	fmt.Fprintln(w, "(e.g. the VSCode extension): 'fg: status', 'fg: health'.")
 	return nil
 }
 

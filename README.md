@@ -93,23 +93,19 @@ Each new prompt is classified by **TF-IDF cosine similarity**:
 | **0.25 - 0.55** | **Branch** | Related to a tree's theme — add under root |
 | **< 0.25** | **New Tree** | Unrelated to anything — start a new topic |
 
-### Markov Chain
+### Continuation for Short Prompts
 
-A **Markov chain** tracks topic-to-topic transitions. When you repeatedly switch between topics in a pattern (e.g. auth -> database -> frontend), the chain learns this and boosts the likely next topic during classification:
+When you send a terse prompt that tokenizes to nothing meaningful — e.g. `"fix"`, `"yes"`, `"continue"`, `"run it"` — cosine similarity is zero against every tree. Rather than spawning a noise tree, Focus Gate attaches such prompts to the **most recently active tree** as a continuation leaf. This preserves context for follow-ups and keeps the forest clean.
 
-```
-score = cosine_similarity * (1 + alpha * P(tree | last_topic))
-```
+If no tree exists yet, a terse prompt is skipped (no new tree is created).
 
-The multiplicative form ensures that a zero-similarity prompt cannot match a tree through transition history alone — Markov only amplifies existing content similarity, acting as a tiebreaker between genuinely related trees.
+### Session Boundaries
 
-**Self-transitions are skipped** — when consecutive prompts hit the same tree, no transition is recorded. This prevents `P(A|A)` from inflating and creating redundant stickiness on top of the existing recency/decay mechanism. The prediction line shows genuinely predicted topic *switches*, not the current topic.
+After `sessionTimeout` hours of inactivity (default 4h), a session boundary fires on the next prompt. Every node's frequency is halved (minimum 1) so an old session doesn't dominate scoring for the new one. Set `sessionTimeout` to `0` to disable.
 
-`alpha` defaults to 0.2. A prediction line appears in the context output when the top transition probability exceeds 30%:
+### Cluster Merging
 
-```
-  -> next: database migration (78%)
-```
+After each prompt, if two tree roots are semantically close (cosine ≥ `mergeSimilarity`, default 0.6), the smaller tree is merged into the larger one and bubble-up is re-run. This prevents slow fragmentation when related prompts keep spawning sibling trees. One merge per prompt to bound the cost; repeated similar prompts will converge over a few rounds.
 
 ### Self-Cleaning
 
@@ -125,6 +121,12 @@ Pruning builds a min-heap **once**, then pops entries in a loop with **parent ca
 
 Nodes carry an **indexed** flag that tracks whether their content was registered with the TF-IDF engine. Only real user-prompt nodes are indexed; synthetic bubble-up abstractions are not. During pruning, only indexed content triggers `RemoveDocument`, preventing document-frequency counters from drifting over long sessions.
 
+### Bidirectional Guide Reinforcement
+
+The Guide doesn't just display past AI responses — it feeds them back into the forest. Before each prompt is classified, unreinforced guide entries are tokenized, vectorized, and matched against tree roots by cosine similarity. The best-matching root is **touched** (weight and recency increase), making actively-discussed trees stickier and harder to prune.
+
+This means both user prompts and AI responses shape the intent forest. When you ask about "authentication" and the AI responds about "JWT token rotation," that response reinforces the authentication tree. Each entry is marked as reinforced after processing, so it is never double-counted across restarts.
+
 ---
 
 ## Install
@@ -135,13 +137,15 @@ Download the binary for your platform from [Releases](https://github.com/kuandri
 go build -o focus-gate ./cmd/focus
 ```
 
+> The binary requires no runtime dependencies. Drop it anywhere on your `$PATH` (e.g. `~/.local/bin/`) or reference it by absolute path.
+
 ---
 
 ## Usage
 
 ### As a Claude Code Hook
 
-Add to `.claude/settings.local.json`:
+Add to `.claude/settings.local.json` in the target project:
 
 ```json
 {
@@ -151,7 +155,7 @@ Add to `.claude/settings.local.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/focus-gate"
+            "command": "/absolute/path/to/focus-gate"
           }
         ]
       }
@@ -160,23 +164,27 @@ Add to `.claude/settings.local.json`:
 }
 ```
 
+> Focus Gate is a CLI-level hook. It runs in the terminal-based Claude Code session. The VSCode extension does not fire `UserPromptSubmit` hooks, so `/focus` in-chat commands do not reach the binary there — run Focus Gate via the CLI instead.
+
 ### In-Chat Commands
 
-Type any `/focus` command directly in your Claude Code conversation. The command is intercepted before classification — **no state is modified**, the output appears inline as context.
+Type any `/focus` command (CLI) or the equivalent `fg:` alias (works in every environment, including the VSCode extension where the `/` slash picker would otherwise intercept the command) directly in chat. The command is routed to the inspector before classification — **no state is modified**, the output appears inline as a fenced block.
 
-| Command | Description |
-|:---|:---|
-| `/focus status` | Compact context summary (same output the AI normally sees) |
-| `/focus inspect` | Full state dump — forest hierarchy, TF-IDF, guide, Markov |
-| `/focus tree` | List all trees with scores |
-| `/focus tree 0` | Deep-dive into tree #0 — full node hierarchy, vector terms, pruning candidates |
-| `/focus tree abc123` | Deep-dive by partial tree ID |
-| `/focus terms` | TF-IDF vocabulary — top 30 terms with DF and IDF values |
-| `/focus terms 50` | Show top 50 terms |
-| `/focus markov` | Transition matrix with probabilities |
-| `/focus score "prompt"` | Dry-run classification — see how a prompt would be scored without sending it |
-| `/focus health` | System diagnostics — memory pressure, tree balance, staleness, pruning forecast |
-| `/focus help` | List all available commands |
+| CLI form | Alias | Description |
+|:---|:---|:---|
+| `/focus status` | `fg: status` | Compact context summary (same output the AI normally sees) |
+| `/focus inspect` | `fg: inspect` | Full state dump — forest hierarchy, TF-IDF engine, guide |
+| `/focus tree` | `fg: tree` | List all trees with scores |
+| `/focus tree 0` | `fg: tree 0` | Deep-dive into tree #0 — full node hierarchy, vector terms, pruning candidates |
+| `/focus tree abc123` | `fg: tree abc123` | Deep-dive by partial tree ID |
+| `/focus terms` | `fg: terms` | TF-IDF vocabulary — top 30 terms with DF and IDF values |
+| `/focus terms 50` | `fg: terms 50` | Show top 50 terms |
+| `/focus last` | `fg: last` | Last classifications (action + similarity score) |
+| `/focus score "prompt"` | `fg: score "prompt"` | Dry-run classification — see how a prompt would be scored without sending it |
+| `/focus health` | `fg: health` | System diagnostics — memory pressure, tree balance, staleness, pruning forecast |
+| `/focus help` | `fg: help` | List all available commands |
+
+> **Why the `fg:` alias?** The `/focus` slash form works in the Claude Code CLI. In the VSCode extension the leading `/` is intercepted by the slash-command picker before the hook sees it, so the short non-slash alias `fg:` is provided. Both route to the same handler; pick whichever fits your environment.
 
 #### Example: `/focus health`
 
@@ -201,8 +209,6 @@ Type any `/focus` command directly in your Claude Code conversation. The command
     [PRUNE?] tree#1 i9j0k1l2  score=0.1205  "add index on email column"
 
     58 slots remaining before pruning triggers.
-
-  Markov:  2 topics tracked, last=a1b2c3d4 (authentication...)
 ```
 
 #### Example: `/focus tree 0`
@@ -255,6 +261,9 @@ Type any `/focus` command directly in your Claude Code conversation. The command
 # Dry-run as JSON
 ./focus-gate --dry-run "your prompt text" --json
 
+# List data directories for all known projects
+./focus-gate --list-projects
+
 # Process a prompt (hook mode, reads JSON from stdin)
 echo '{"prompt":"your prompt text"}' | ./focus-gate
 ```
@@ -266,27 +275,20 @@ The CLI flags are useful for scripting and programmatic analysis. For day-to-day
 The injected context looks like this:
 
 ```
-[Focus | 12 prompts | 8/100 mem | 3 trees]
+[Focus | 12 prompts | 8/100 mem | 3 trees | extend 0.61]
   [0.95] token | authentica | session | jwt
     - add refresh token rotation
     - fix the session expiry bug
   [0.82] database | migration | schema
     - add index on email column
   [0.45] readme | documentation | project
-  -> next: database migration (78%)
 Guide:
   - Implemented JWT auth with RS256 signing
   - Created users migration with email index
 [/Focus]
 ```
 
-Trees are sorted by score (highest first), limited to 5. Each tree shows up to 3 recent leaves. The entire output is capped at `contextLimit` characters (default 600).
-
-### Bidirectional Guide Reinforcement
-
-The Guide doesn't just display past AI responses — it feeds them back into the forest. Before each prompt is classified, unreinforced guide entries are tokenized, vectorized, and matched against tree roots by cosine similarity. The best-matching root is **touched** (weight and recency increase), making actively-discussed trees stickier and harder to prune.
-
-This means both user prompts and AI responses shape the intent forest. When you ask about "authentication" and the AI responds about "JWT token rotation," that response reinforces the authentication tree. Each entry is marked as reinforced after processing, so it is never double-counted.
+The header includes the classification action taken for the current prompt (`extend`, `branch`, `new`, or `continue`) and the similarity score. Trees are sorted by score (highest first), limited to 5. Each tree shows up to 3 recent leaves. The entire output is capped at `contextLimit` characters (default 600).
 
 ---
 
@@ -297,7 +299,7 @@ This means both user prompts and AI responses shape the intent forest. When you 
 [TF-IDF](https://en.wikipedia.org/wiki/Tf%E2%80%93idf) converts text into numerical vectors where each dimension represents a term's importance.
 
 - **Term Frequency (TF)**: `count(term in doc) / length(doc)`
-- **Inverse Document Frequency (IDF)**: `log2(1 + effectiveDocs / df(term))` — rare terms score higher. `effectiveDocs` is `max(totalDocs, 5)` — a virtual floor that ensures IDF can discriminate between terms even during the first few prompts of a session, when the corpus is too small for meaningful frequency statistics
+- **Inverse Document Frequency (IDF)**: `log2(1 + effectiveDocs / df(term))` — rare terms score higher. `effectiveDocs` is `max(totalDocs, 5)` — a virtual floor that ensures IDF can discriminate between terms even during the first few prompts of a session, when the corpus is too small for meaningful frequency statistics.
 - **TF-IDF**: `TF * IDF`
 
 ### Cosine Similarity
@@ -315,8 +317,9 @@ Uses a two-level comparison:
 
 1. Compare prompt vector against each tree's **root** (catches broad thematic matches)
 2. Compare against each tree's **leaves** (catches precise matches)
-3. Multiply by Markov transition boost per tree
-4. Best score determines action (extend / branch / new)
+3. Best score determines action (extend / branch / new)
+
+If the prompt tokenizes to nothing meaningful (stop words only, or very short), the classifier returns `continue` and attaches the prompt to the most recently active tree.
 
 Node vectors are **cached** after first computation and invalidated when content changes (bubble-up) or when a new document shifts IDF weights. This avoids re-tokenizing and re-vectorizing every node on every prompt.
 
@@ -356,11 +359,21 @@ depthFactor = 1 / (1 + depth * 0.15)
 
 At default decay rate (0.05), a node untouched for 24 hours retains 30% recency. After 48 hours: 9%.
 
+### File Reference Extraction
+
+Every prompt is scanned for file paths — either explicit (`src/auth/middleware.go`) or backtick-quoted (`` `handler.ts` ``). URLs and Go-style package imports (domain-looking paths) are filtered out. Paths are validated against the project's working directory; non-existent paths are dropped, so references reflect actual code, not rhetorical mentions. The resulting refs are attached to the node and surface in the injected context so the AI knows which files are in scope.
+
 ---
 
 ## Configuration
 
-Create a `config.json` alongside the binary:
+Configuration resolution order (first match wins):
+
+1. `.focus-gate.json` in the current project directory
+2. `$FOCUS_GATE_CONFIG` — explicit path via environment variable
+3. `config.json` alongside the binary (global fallback)
+
+Example `config.json`:
 
 ```json
 {
@@ -369,13 +382,14 @@ Create a `config.json` alongside the binary:
   "similarity": { "extend": 0.55, "branch": 0.25 },
   "contextLimit": 600,
   "bubbleUpTerms": 6,
-  "maxSourcesPerNode": 20,
+  "maxRefsPerNode": 5,
   "guideSize": 15,
-  "transitionBoost": 0.2
+  "sessionTimeout": 4.0,
+  "mergeSimilarity": 0.6
 }
 ```
 
-Only fields present in the file override defaults. A field explicitly set to `0` (e.g. `"transitionBoost": 0` to disable Markov boost) is respected — it will not be replaced with the default.
+Only fields present in the file override defaults. A field explicitly set to `0` (e.g. `"sessionTimeout": 0` to disable session boundaries) is respected — it will not be replaced with the default.
 
 | Parameter | Default | Description |
 |:---|:---:|:---|
@@ -385,43 +399,49 @@ Only fields present in the file override defaults. A field explicitly set to `0`
 | `similarity.branch` | 0.25 | Threshold to branch into an existing tree |
 | `contextLimit` | 600 | Maximum characters in the context block |
 | `bubbleUpTerms` | 6 | Top terms in bubble-up abstractions |
-| `maxSourcesPerNode` | 20 | Maximum source IDs stored per node |
+| `maxRefsPerNode` | 5 | Maximum file references stored per node |
 | `guideSize` | 15 | Maximum AI response entries tracked |
-| `transitionBoost` | 0.2 | Markov chain boost factor (0 to disable) |
+| `sessionTimeout` | 4.0 | Hours of inactivity before session boundary halves frequencies. `0` disables. |
+| `mergeSimilarity` | 0.6 | Cosine threshold for cluster merging of similar trees. `0` disables. |
 
 ### Tuning
 
 - **Too many unrelated trees?** Raise `similarity.branch` (e.g. 0.35)
-- **Related prompts keep splitting?** Lower `similarity.branch` (e.g. 0.20)
-- **Old topics persist too long?** Raise `decayRate` (e.g. 0.10)
+- **Related prompts keep splitting?** Lower `similarity.branch` (e.g. 0.20) or lower `mergeSimilarity` (e.g. 0.5)
+- **Old topics persist too long?** Raise `decayRate` (e.g. 0.10) or lower `sessionTimeout`
 - **Memory fills too quickly?** Raise `memorySize` (e.g. 200)
+- **Unbounded growth concern?** If `sessionTimeout=0` *and* `memorySize` is very high, `engine.json` can grow indefinitely because pruning is what limits the TF-IDF corpus. Keep at least one of the two bounded.
 
 ---
 
 ## Architecture
 
 ```
-cmd/focus/          Entry point (CLI, stdin/stdout, inspect/dry-run)
+cmd/focus/          Entry point (CLI, stdin/stdout, inspect/dry-run, /focus commands)
 internal/
-  text/             Tokenizer, stemmer, stop words
+  text/             Tokenizer, stemmer, stop words, file-ref extraction
   tfidf/            TF-IDF engine, sparse vectors, cosine similarity
   forest/           Node, Tree, Forest, heap-based pruning
-  gate/             Focus Gate classifier (classify, apply, bubble-up, dry-run)
-  markov/           Topic transition chain (prediction, boost)
+  gate/             Focus Gate classifier (classify, apply, bubble-up, merge, dry-run)
   guide/            AI response tracking (ring buffer + forest reinforcement)
-  persist/          Atomic JSON persistence (Windows-safe, .tmp recovery)
+  persist/          Atomic JSON persistence (Windows-safe, .tmp recovery, schema version)
 ```
 
-Data is persisted as JSON in a `data/` directory alongside the binary. Writes use **atomic save** (write to `.tmp`, then rename). On Windows, where `os.Rename` is not atomic, the target is removed before rename; a **recovery pass** on startup promotes any orphaned `.tmp` files left by interrupted saves.
+Data is persisted as JSON in a per-project data directory. Each project (keyed by `sha256(cwd)[:12]`) gets its own namespace under `~/.focus-gate/<slug>/`, so state never leaks between projects. Override with `--data-dir` or `$FOCUS_GATE_DATA_DIR`.
+
+Writes use **atomic save** (write to `.tmp`, then rename). On Windows, where `os.Rename` is not atomic, the target is removed before rename; a **recovery pass** on startup promotes any orphaned `.tmp` files left by interrupted saves.
+
+Concurrent invocations of the hook acquire a file lock on the data directory to prevent races during simultaneous state reads/writes.
+
+Every persisted file carries a `schemaVersion` field. Loaders reject mismatched versions with a warning to stderr and fall back to empty state rather than corrupting data with partial unmarshaling.
 
 All `persist.Load` errors are logged to stderr rather than silently discarded — a corrupt file does not block the user's prompt; the system continues with empty state and the user can `--reset` if needed.
 
 | File | Purpose |
 |:---|:---|
-| `data/intent.json` | Intent forest — what the user is asking about |
-| `data/engine.json` | TF-IDF document frequency counts |
-| `data/guide.json` | AI response summaries with intent links and reinforcement state |
-| `data/markov.json` | Topic transition probability matrix |
+| `intent.json` | Intent forest — what the user is asking about |
+| `engine.json` | TF-IDF document frequency counts |
+| `guide.json` | AI response summaries with intent links and reinforcement state |
 
 ---
 

@@ -13,17 +13,25 @@ import (
 // this floor has no effect.
 const minVirtualDocs = 5
 
+// SchemaVersion is the on-disk schema version for engine.json.
+const SchemaVersion = "1"
+
 // Engine is an incremental TF-IDF engine. Unlike rebuilding the entire corpus
 // on every invocation, it persists document frequency counts and updates them
 // incrementally as documents are added or removed (during pruning).
 type Engine struct {
+	Schema    string         `json:"schemaVersion"`
 	DocFreq   map[string]int `json:"docFreq"`
 	TotalDocs int            `json:"totalDocs"`
 }
 
+// SetSchemaVersion implements persist.SchemaVersioner.
+func (e *Engine) SetSchemaVersion(v string) { e.Schema = v }
+
 // NewEngine creates an empty TF-IDF engine.
 func NewEngine() *Engine {
 	return &Engine{
+		Schema:  SchemaVersion,
 		DocFreq: make(map[string]int),
 	}
 }

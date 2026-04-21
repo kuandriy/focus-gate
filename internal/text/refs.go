@@ -1,6 +1,8 @@
 package text
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -85,4 +87,30 @@ func ExtractFilePaths(text string, maxRefs int) []string {
 		refs = refs[:maxRefs]
 	}
 	return refs
+}
+
+// FilterExistingPaths returns only those paths that exist on disk relative to
+// baseDir. An empty baseDir disables validation and the input is returned
+// unchanged — callers that can't supply a working directory (tests, CI dry
+// runs) still get the full set. Relative paths are resolved against baseDir;
+// absolute paths are used as-is.
+//
+// This is the cheap antidote to rhetorical mentions ("store it in /var/log")
+// accumulating as phantom refs. The cost is one os.Stat per path at
+// classification time, which is negligible compared to tokenize+vectorize.
+func FilterExistingPaths(baseDir string, paths []string) []string {
+	if baseDir == "" || len(paths) == 0 {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		resolved := p
+		if !filepath.IsAbs(p) {
+			resolved = filepath.Join(baseDir, p)
+		}
+		if _, err := os.Stat(resolved); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }

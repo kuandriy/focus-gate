@@ -19,6 +19,7 @@ forest, and injects a compact context block before every message you send.
   - [tree](#focus-tree)
   - [terms](#focus-terms)
   - [score](#focus-score)
+  - [last](#focus-last)
   - [health](#focus-health)
   - [help](#focus-help)
 - [CLI Flags](#cli-flags)
@@ -135,8 +136,14 @@ runs out.
 
 ## Configuration
 
-Create `config.json` **alongside the binary** (not in the project directory —
-this is a shared config across all projects):
+Focus Gate resolves configuration in this order (first match wins):
+
+1. `.focus-gate.json` in the current project directory (per-project override)
+2. `$FOCUS_GATE_CONFIG` — explicit path via environment variable
+3. `config.json` alongside the binary (global fallback, shared across projects)
+
+The per-project file lets you tune thresholds for a particular codebase
+without affecting your other projects. Create `config.json`:
 
 ```json
 {
@@ -151,7 +158,7 @@ this is a shared config across all projects):
   "maxRefsPerNode": 5,
   "guideSize": 15,
   "sessionTimeout": 4.0,
-  "mergeSimilarity": 0.7
+  "mergeSimilarity": 0.6
 }
 ```
 
@@ -172,17 +179,23 @@ disable session boundaries) is respected as-is.
 | `maxRefsPerNode` | 5 | Max file paths stored per node |
 | `guideSize` | 15 | Max AI response summaries in the guide |
 | `sessionTimeout` | 4.0 | Hours of inactivity before session boundary (0 = off) |
-| `mergeSimilarity` | 0.7 | Root cosine threshold for merging similar trees (0 = off) |
+| `mergeSimilarity` | 0.6 | Root cosine threshold for merging similar trees (0 = off) |
 
 ---
 
 ## In-Chat Commands
 
-Type any `/focus` command directly in the chat. The command is intercepted
-before classification — **no state is modified** — and the output appears inline.
+Type any `/focus <sub>` command directly in the chat. The command is
+intercepted before classification — **no state is modified** — and the
+output appears inline.
 
-All commands are case-insensitive: `/focus STATUS`, `/Focus Tree 0`, and
-`/focus status` are equivalent.
+**VSCode users:** the Claude Code extension's slash-command picker swallows
+anything that starts with `/`, so commands never reach the hook there. Use
+the `fg:` alias instead (`fg: status`, `fg: health`, `fg: tree 0`, etc.).
+Both prefixes route to the same handler; the CLI also accepts `fg:`.
+
+All commands are case-insensitive: `/focus STATUS`, `/Focus Tree 0`,
+`fg: Status`, and `FG: tree 0` are equivalent.
 
 ---
 
@@ -334,6 +347,34 @@ Example:
 Use this before sending an important prompt to verify it classifies where you
 expect, or to understand why a previous prompt went to the wrong tree.
 
+If the top score falls in a narrow "near-miss" band below `branch` (e.g. 0.15
+to 0.25 when `branch = 0.25`), the dry-run surfaces a warning explaining that
+a typo or rare-term mismatch may have prevented a match you expected. The
+warning does not change behaviour — it is strictly diagnostic.
+
+---
+
+### `/focus last`
+
+Shows the most recent classifications — action, top similarity, and snippet of
+the prompt that triggered each. Useful when a prompt lands in the wrong tree
+and you want to understand why without running a dry-run.
+
+```
+/focus last
+```
+
+Example:
+
+```
+=== Recent Classifications ===
+  #5  extend    0.618  "add refresh token rotation"      -> tree#0
+  #4  branch    0.312  "write migration for users table" -> tree#1
+  #3  new       0.000  "update the readme section"       -> tree#2
+  #2  continue  0.000  "yes"                             -> tree#0 (recent)
+  #1  extend    0.554  "fix the session expiry bug"      -> tree#0
+```
+
 ---
 
 ### `/focus health`
@@ -414,6 +455,9 @@ check without opening Claude Code.
 # Override the data directory (useful for scripting)
 ./focus-gate --data-dir /path/to/dir --status
 
+# List all per-project data directories (name, hash, size, last-modified)
+./focus-gate --list-projects
+
 # Suppress stderr logging
 ./focus-gate --quiet --status
 ```
@@ -487,6 +531,13 @@ Each prompt goes through this pipeline:
 | >= 0.55 (`extend`) | **Extend** | Added as sibling near the matching leaf |
 | 0.25 – 0.55 (`branch`) | **Branch** | Added as child under the tree root |
 | < 0.25 | **New tree** | A new topic tree is created |
+| empty vector | **Continue** | Attached to the most-recently-active tree |
+
+The **continue** action handles terse prompts like `fix`, `yes`, `run it`, or
+`continue` that tokenize to nothing after stop-word filtering. Instead of
+spawning a noise tree for every one-word follow-up, Focus Gate treats them as
+implicit continuations of whatever you were just working on. If no tree exists
+yet, the prompt is skipped entirely.
 
 5. **Apply**: insert the new node, then run **bubble-up** — regenerate every
    parent's content bottom-up as the top N terms across its children, weighted
@@ -561,7 +612,7 @@ Set `"sessionTimeout": 0` in config to disable this behaviour.
 ## Cluster Merging
 
 After each prompt, Focus Gate compares every pair of tree roots. If any two
-roots score >= `mergeSimilarity` (default: 0.7) against each other, the smaller
+roots score >= `mergeSimilarity` (default: 0.6) against each other, the smaller
 tree's leaves are re-parented under the larger tree's root, and bubble-up is
 re-run. Only one merge fires per prompt to avoid cascades.
 
@@ -585,7 +636,9 @@ appear as:
 
 Supported extensions cover common code, config, and infra files (Go, TypeScript,
 Python, SQL, YAML, Terraform, etc.). URLs and Go module import paths are filtered
-out.
+out. Extracted paths are validated against the project working directory with
+`os.Stat`; paths that do not exist on disk are dropped before being stored, so
+rhetorical mentions never accumulate as false refs.
 
 Up to `maxRefsPerNode` (default: 5) paths are stored per node.
 
@@ -604,8 +657,10 @@ You can override the data directory three ways (checked in priority order):
 2. `FOCUS_GATE_DATA_DIR` environment variable
 3. Default per-project isolation (`~/.focus-gate/<hash>/`)
 
-The `config.json` file lives **alongside the binary** (not in the data
-directory) and is shared across all projects.
+Configuration is resolved in this order: a `.focus-gate.json` in the project
+directory overrides `$FOCUS_GATE_CONFIG`, which overrides the global
+`config.json` next to the binary. Drop a per-project file when you want to
+tune thresholds for that codebase without touching your global defaults.
 
 ---
 
@@ -615,12 +670,24 @@ All state is written as indented JSON using atomic saves (write to `.tmp`, then
 rename). On startup, any orphaned `.tmp` files from interrupted saves are
 automatically recovered.
 
+Every persisted file carries a `schemaVersion` field at its top level. When
+Focus Gate loads a file, it compares the version on disk against the version
+the binary expects. A mismatch logs a warning to stderr and the file is treated
+as empty state rather than partially unmarshaled — preventing silent data
+corruption across upgrades.
+
+Concurrent invocations of the hook (e.g. two rapid `UserPromptSubmit` events
+from the editor) acquire a file lock on the data directory before reading or
+writing state, so simultaneous writes cannot race and lose prompts.
+
 | File | Contents |
 |:---|:---|
 | `~/.focus-gate/<hash>/intent.json` | Intent forest (trees, nodes, scores) |
 | `~/.focus-gate/<hash>/engine.json` | TF-IDF document frequency counts |
 | `~/.focus-gate/<hash>/guide.json` | AI response summaries with reinforcement state |
-| `config.json` (next to binary) | Configuration overrides |
+| `~/.focus-gate/<hash>/.lock` | File lock (zero-byte, advisory) |
+| `.focus-gate.json` (project root) | Per-project config override |
+| `config.json` (next to binary) | Global configuration fallback |
 
 These files are human-readable JSON and can be inspected or deleted manually.
 A corrupt file logs an error to stderr and the system continues with empty
@@ -640,10 +707,10 @@ Lower the branch threshold so more prompts join existing trees:
 
 ### Related prompts creating separate trees?
 
-Raise merge similarity so closer trees get merged sooner:
+Lower merge similarity so closer trees get merged sooner:
 
 ```json
-{ "mergeSimilarity": 0.6 }
+{ "mergeSimilarity": 0.5 }
 ```
 
 Or lower the branch threshold:

@@ -1,6 +1,8 @@
 package text
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -147,5 +149,50 @@ func TestExtractFilePaths_ZeroMaxRefs(t *testing.T) {
 	got := ExtractFilePaths("src/auth/jwt.go", 0)
 	if got != nil {
 		t.Errorf("maxRefs=0 should return nil, got %v", got)
+	}
+}
+
+func TestFilterExistingPaths_EmptyBaseDirIsNoOp(t *testing.T) {
+	in := []string{"a.go", "b/c.go"}
+	got := FilterExistingPaths("", in)
+	if len(got) != len(in) {
+		t.Errorf("empty baseDir should pass paths through, got %v", got)
+	}
+}
+
+func TestFilterExistingPaths_DropsMissingFiles(t *testing.T) {
+	dir := t.TempDir()
+	// Create one real file; the other is rhetorical.
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "real.go"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := []string{"src/real.go", "var/log/phantom.json"}
+	got := FilterExistingPaths(dir, paths)
+
+	if len(got) != 1 || got[0] != "src/real.go" {
+		t.Errorf("expected only src/real.go to survive, got %v", got)
+	}
+}
+
+func TestFilterExistingPaths_AbsolutePathsHandledIndependentlyOfBaseDir(t *testing.T) {
+	// An absolute path should be checked as-is, ignoring baseDir.
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.go")
+	if err := os.WriteFile(real, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// baseDir is unrelated (TempDir ensures uniqueness). Absolute paths
+	// should still resolve correctly.
+	unrelatedBase := t.TempDir()
+	missing := filepath.Join(dir, "phantom.go")
+
+	got := FilterExistingPaths(unrelatedBase, []string{real, missing})
+	if len(got) != 1 || got[0] != real {
+		t.Errorf("expected only the real absolute path to survive, got %v", got)
 	}
 }
