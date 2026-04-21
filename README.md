@@ -184,9 +184,31 @@ Type any `/focus` command (CLI) or the equivalent `fg:` alias (works in every en
 | `/focus health` | `fg: health` | System diagnostics — memory pressure, tree balance, staleness, pruning forecast |
 | `/focus help` | `fg: help` | List all available commands |
 
-> **Why the `fg:` alias?** The `/focus` slash form works in the Claude Code CLI. In the VSCode extension the leading `/` is intercepted by the slash-command picker before the hook sees it, so the short non-slash alias `fg:` is provided. Both route to the same handler; pick whichever fits your environment.
+> **Why the `fg:` alias?** The `/focus` slash form works in the Claude Code CLI. In the VSCode extension the leading `/` is intercepted by the slash-command picker before the hook sees it, so the short non-slash alias `fg:` is provided. Both route to the same handler; pick whichever fits your environment. The following examples use `fg:` (since it works everywhere), but every output is identical under `/focus`.
 
-#### Example: `/focus health`
+#### Example: `fg: status`
+
+Compact summary of the current forest state — the same block the AI sees as injected context on every prompt.
+
+```
+[Focus | 23 prompts | 18/100 mem | 3 trees]
+  [0.95] token | authentica | session | jwt
+    - add refresh token rotation
+    - fix the session expiry bug
+  [0.82] migrat | schema | user | email
+    - add index on email column
+  [0.45] readme | documentation | project
+Guide:
+  - Implemented JWT auth with RS256 signing
+  - Created users migration with email index
+[/Focus]
+```
+
+Each tree's `[0.95]`-style prefix is its decay-weighted score. Leaves are shown most-recent-first, truncated to 3 per tree, and the whole block is capped at `contextLimit` characters (default 600). The `Guide:` section lists AI response summaries linked to still-alive intent nodes.
+
+#### Example: `fg: health`
+
+System diagnostics — memory pressure, per-tree temperature, TF-IDF noise ratio, and a forecast of which leaves are closest to being pruned.
 
 ```
 === Focus Health ===
@@ -211,7 +233,26 @@ Type any `/focus` command (CLI) or the equivalent `fg:` alias (works in every en
     58 slots remaining before pruning triggers.
 ```
 
-#### Example: `/focus tree 0`
+HOT/WARM/COLD thresholds: HOT ≥ 0.5 (actively worked on), WARM 0.1–0.5 (recent but cooling), COLD < 0.1 (likely to be pruned soon). Noise ratio rising above ~50% is a signal that your session has accumulated many one-off typos or cryptic prompts.
+
+#### Example: `fg: last`
+
+Ring buffer of the most recent classifications — action taken, top similarity score, and the prompt snippet that triggered each. Useful when a prompt lands in an unexpected tree.
+
+```
+=== Recent Classifications ===
+  #5  extend    0.618  "add refresh token rotation"      -> tree#0
+  #4  branch    0.312  "write migration for users table" -> tree#1
+  #3  new       0.000  "update the readme section"       -> tree#2
+  #2  continue  0.000  "yes"                             -> tree#0 (recent)
+  #1  extend    0.554  "fix the session expiry bug"      -> tree#0
+```
+
+The `continue` entry shows the M2 behaviour in action: a terse prompt ("yes") was attached to the most-recently-active tree rather than spawning its own noise tree.
+
+#### Example: `fg: tree 0`
+
+Deep-dive into a specific tree. Without an argument, `fg: tree` lists all trees with scores; with a numeric index or partial hex ID, the full node hierarchy appears.
 
 ```
 === Tree: a1b2c3d4e5f6 ===
@@ -239,6 +280,37 @@ Type any `/focus` command (CLI) or the equivalent `fg:` alias (works in every en
     [PRUNE?] c3d4e5f6  score=0.843  "fix the session expiry bug"
     [PRUNE?] b2c3d4e5  score=0.871  "add JWT authentication to the API"
 ```
+
+Node columns: `d` = depth, `w` = log₂ weight, `f` = frequency (times touched), `idx` = registered in the TF-IDF corpus (Y = real prompt, − = synthetic bubble-up abstraction), `s` = decay-weighted score.
+
+#### Example: `fg: score "prompt"`
+
+Dry-run classification. Shows how the prompt would be scored against every tree without mutating any state — and flags **near-misses** (scores in `[branch × 0.5, branch)`) that often indicate a typo or rare-term mismatch.
+
+```
+=== Score ===
+  Prompt: "fx the auth middleware"
+  Tokens: [fx auth middlewar]
+
+  TF-IDF Vector (2 terms):
+    authentica           0.4821
+    middlewar            0.3912
+
+  Thresholds: extend >= 0.550, branch >= 0.250
+
+  Tree #0 "token | authentica | session | jwt"
+    Root a1b2c3d4  cosine=0.2103
+    Leaf b2c3d4e5  cosine=0.1918  "add JWT authentication to the API"  <- BEST
+
+  Result: new (score=0.2103)
+    Would create a new topic tree with this prompt.
+
+Near-miss: top score 0.2103 fell short of branch threshold 0.250.
+  A typo, missing stem, or rare-term mismatch may have prevented a match
+  you were expecting. Check /focus tree N to see the tree's vector terms.
+```
+
+The near-miss hint is strictly diagnostic — behaviour is unchanged. Re-running the prompt with the typo fixed ("fix the auth middleware") would likely cross the branch threshold and extend the existing tree.
 
 ### CLI Flags
 
