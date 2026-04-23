@@ -1,9 +1,5 @@
 package gate
 
-import (
-	"github.com/kuandriy/focus-gate/internal/text"
-)
-
 // VectorTerm is a single term-weight pair for display in dry-run output.
 // It mirrors tfidf.Term but with JSON-friendly field names.
 type VectorTerm struct {
@@ -65,7 +61,7 @@ const nearMissFraction = 0.5
 // The caller should apply text.CleanPrompt before passing the prompt here,
 // matching the pre-processing that handlePrompt performs in the hook path.
 func (g *Gate) DryRun(prompt string) DryRunResult {
-	tokens := text.Tokenize(prompt)
+	tokens := g.tokenize(prompt)
 	vec := g.Engine.VectorizeTokens(tokens)
 
 	// Convert the TF-IDF vector to a display-friendly format.

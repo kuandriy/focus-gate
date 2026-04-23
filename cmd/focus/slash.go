@@ -22,59 +22,45 @@ type slashCommand struct {
 	arg string // e.g. tree index/ID, or prompt text for score
 }
 
-// commandPrefixes are the recognised triggers that route a prompt through the
-// inspector instead of normal classification:
-//   - "/focus" — the conventional form, works in the Claude Code CLI.
-//   - "fg:"    — short non-slash alias for environments like the VSCode
-//     extension where a leading "/" is intercepted by the slash-command
-//     picker before the hook can see it. Deliberately short so it's cheap
-//     to type; "fg" is distinctive enough to never collide with English
-//     prose as a sentence opener.
-var commandPrefixes = []string{"/focus", "fg:"}
+// commandPrefix is the hook-level trigger that routes a prompt through the
+// inspector instead of normal classification.
+//
+// "/focus <sub>" exists at a different layer — a registered Claude Code
+// custom slash command (.claude/commands/focus.md) that runs the binary
+// in --cmd mode. That path never reaches UserPromptSubmit, so the hook
+// parser does not need to recognise it. "fg:" is the bedrock: works in
+// any environment where the hook runs, with zero additional setup. Short
+// enough to type, distinctive enough to never collide with English prose.
+const commandPrefix = "fg:"
 
-// parseSlashCommand checks whether the raw (uncleaned) prompt begins with one
-// of the recognised command prefixes and, if so, extracts the subcommand and
+// parseSlashCommand checks whether the raw (uncleaned) prompt begins with
+// the hook-level command prefix and, if so, extracts the subcommand and
 // optional argument. Returns (cmd, true) on match, zero value otherwise.
 //
 // Matching rules:
 //   - Leading whitespace is trimmed.
-//   - Case-insensitive on the prefix itself ("/FOCUS", "Focus:" both match).
-//   - After the prefix we require either end-of-string or whitespace, so
-//     "focus:foo" matches (treated as sub "foo", no space needed after ":" or
-//     "!") but "/focusgate" does not match the "/focus" prefix.
+//   - Case-insensitive ("FG:", "Fg:", "fg:" all match).
+//   - The ":" self-delimits, so "fg:status" and "fg: status" both work.
 func parseSlashCommand(raw string) (slashCommand, bool) {
 	trimmed := strings.TrimSpace(raw)
 	lower := strings.ToLower(trimmed)
 
-	for _, prefix := range commandPrefixes {
-		if !strings.HasPrefix(lower, prefix) {
-			continue
-		}
-		// For the "/focus" form we require a word boundary (space) after the
-		// prefix to avoid matching "/focusgate". The "focus:" and "focus!"
-		// forms already self-delimit with their trailing punctuation, so no
-		// extra boundary check is needed.
-		if prefix == "/focus" {
-			if len(lower) > len(prefix) && lower[len(prefix)] != ' ' {
-				return slashCommand{}, false
-			}
-		}
-
-		rest := strings.TrimSpace(trimmed[len(prefix):])
-		if rest == "" {
-			return slashCommand{sub: "help"}, true
-		}
-
-		parts := strings.SplitN(rest, " ", 2)
-		sub := strings.ToLower(parts[0])
-		arg := ""
-		if len(parts) > 1 {
-			arg = strings.TrimSpace(parts[1])
-		}
-		return slashCommand{sub: sub, arg: arg}, true
+	if !strings.HasPrefix(lower, commandPrefix) {
+		return slashCommand{}, false
 	}
 
-	return slashCommand{}, false
+	rest := strings.TrimSpace(trimmed[len(commandPrefix):])
+	if rest == "" {
+		return slashCommand{sub: "help"}, true
+	}
+
+	parts := strings.SplitN(rest, " ", 2)
+	sub := strings.ToLower(parts[0])
+	arg := ""
+	if len(parts) > 1 {
+		arg = strings.TrimSpace(parts[1])
+	}
+	return slashCommand{sub: sub, arg: arg}, true
 }
 
 // handleSlashCommand dispatches a parsed slash command to the appropriate handler.
@@ -103,6 +89,9 @@ func handleSlashCommand(cmd slashCommand, p paths, cfg config, w io.Writer) erro
 
 	case "last":
 		return slashLast(w, f)
+
+	case "memory":
+		return slashMemory(w, p, cfg, e, cmd.arg)
 
 	case "health":
 		return slashHealth(w, f, e, cfg)
@@ -557,10 +546,12 @@ func slashHelp(w io.Writer) error {
 	fmt.Fprintln(w, "  /focus score \"prompt\"  Dry-run classification scoring")
 	fmt.Fprintln(w, "  /focus last            Recent classifications (action + score)")
 	fmt.Fprintln(w, "  /focus health          System diagnostics and pruning forecast")
+	fmt.Fprintln(w, "  /focus memory ...      Long-term memory: list | show <id> | pending | discard <id|all> | health")
 	fmt.Fprintln(w, "  /focus help            This help message")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Short alias for environments where '/' is intercepted")
-	fmt.Fprintln(w, "(e.g. the VSCode extension): 'fg: status', 'fg: health'.")
+	fmt.Fprintln(w, "Two ways to invoke:")
+	fmt.Fprintln(w, "  /focus <sub>    registered slash command (resolves via .claude/commands)")
+	fmt.Fprintln(w, "  fg: <sub>       hook-level intercept — works anywhere the hook runs")
 	return nil
 }
 

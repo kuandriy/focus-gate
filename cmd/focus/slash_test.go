@@ -17,28 +17,34 @@ func TestParseSlashCommand(t *testing.T) {
 	}{
 		{"empty", "", false, "", ""},
 		{"normal prompt", "add JWT authentication", false, "", ""},
-		{"just /focus", "/focus", true, "help", ""},
-		{"focus with space", "  /focus  ", true, "help", ""},
+
+		// The hook parser intentionally does NOT recognise "/focus …" —
+		// that form is handled by Claude Code's custom-command layer
+		// (.claude/commands/focus.md running the binary in --cmd mode)
+		// and never reaches UserPromptSubmit. Asserting these parse as
+		// false guards against anyone re-adding the prefix later.
+		{"/focus alone not hook-level", "/focus", false, "", ""},
+		{"/focus status not hook-level", "/focus status", false, "", ""},
+		{"/focus tree not hook-level", "/focus tree 0", false, "", ""},
+
+		// fg: is the sole hook-level trigger.
 		{"just fg:", "fg:", true, "help", ""},
 		{"fg: status", "fg: status", true, "status", ""},
 		{"fg:status no space", "fg:status", true, "status", ""},
 		{"fg: health", "fg: health", true, "health", ""},
 		{"FG: case", "FG: status", true, "status", ""},
-		{"help", "/focus help", true, "help", ""},
-		{"status", "/focus status", true, "status", ""},
-		{"inspect", "/focus inspect", true, "inspect", ""},
-		{"tree no arg", "/focus tree", true, "tree", ""},
-		{"tree with index", "/focus tree 2", true, "tree", "2"},
-		{"tree with id", "/focus tree abc123", true, "tree", "abc123"},
-		{"terms", "/focus terms", true, "terms", ""},
-		{"terms with count", "/focus terms 50", true, "terms", "50"},
-		{"last", "/focus last", true, "last", ""},
-		{"score with prompt", "/focus score add auth to api", true, "score", "add auth to api"},
-		{"health", "/focus health", true, "health", ""},
-		{"case insensitive", "/FOCUS STATUS", true, "status", ""},
-		{"mixed case", "/Focus Tree 0", true, "tree", "0"},
-		{"unknown sub", "/focus foobar", true, "foobar", ""},
-		{"not slash focus", "/focusgate status", false, "", ""},
+		{"fg: tree with index", "fg: tree 2", true, "tree", "2"},
+		{"fg: tree with id", "fg: tree abc123", true, "tree", "abc123"},
+		{"fg: terms", "fg: terms", true, "terms", ""},
+		{"fg: terms with count", "fg: terms 50", true, "terms", "50"},
+		{"fg: last", "fg: last", true, "last", ""},
+		{"fg memory health", "fg: memory health", true, "memory", "health"},
+		{"fg memory show", "fg: memory show abc", true, "memory", "show abc"},
+		{"fg: score with prompt", "fg: score add auth to api", true, "score", "add auth to api"},
+		{"fg: unknown sub", "fg: foobar", true, "foobar", ""},
+
+		// fg: must not match prefixes of other words.
+		{"not fg: — fgate", "fgate status", false, "", ""},
 	}
 
 	for _, tt := range tests {

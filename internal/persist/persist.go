@@ -15,13 +15,21 @@ import (
 // creates a brief window where neither file exists; RecoverTmpFiles handles
 // this on the next startup.
 func SaveAtomic(path string, v any) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
+		return err
+	}
+	return SaveAtomicBytes(path, data)
+}
+
+// SaveAtomicBytes writes raw bytes to a temporary file and then renames it
+// to the target path. Same atomicity guarantees as SaveAtomic, but for
+// payloads that are not JSON (e.g. Markdown memory files). Use SaveAtomic
+// when persisting structs; reach for this only when the bytes are already
+// in their final on-disk form.
+func SaveAtomicBytes(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 

@@ -15,6 +15,7 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 	"github.com/kuandriy/focus-gate/internal/gate"
 	"github.com/kuandriy/focus-gate/internal/guide"
+	"github.com/kuandriy/focus-gate/internal/memory"
 	"github.com/kuandriy/focus-gate/internal/persist"
 	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
@@ -28,6 +29,7 @@ type paths struct {
 	guideFile  string
 	lockFile   string
 	configFile string
+	memoryDir  string // <dataDir>/memories/ — long-term memory file store
 }
 
 // resolveDataDir determines the state directory using this priority:
@@ -80,6 +82,7 @@ func resolvePaths() paths {
 		guideFile:  filepath.Join(dataDir, "guide.json"),
 		lockFile:   filepath.Join(dataDir, ".lock"),
 		configFile: resolveConfigFile(),
+		memoryDir:  filepath.Join(dataDir, "memories"),
 	}
 }
 
@@ -136,6 +139,28 @@ type config struct {
 	GuideSize       int     `json:"guideSize"`
 	SessionTimeout  float64 `json:"sessionTimeout"`  // hours; 0 = disabled
 	MergeSimilarity float64 `json:"mergeSimilarity"` // threshold for cluster merging; 0 = disabled
+	TypoTolerance   struct {
+		Enabled          bool `json:"enabled"`
+		MaxDistance      int  `json:"maxDistance"`
+		MinWordLen       int  `json:"minWordLen"`
+		MinEstablishedDF int  `json:"minEstablishedDF"`
+	} `json:"typoTolerance"`
+	Memory struct {
+		Enabled            bool     `json:"enabled"`
+		Dir                string   `json:"dir"`
+		SurfaceThreshold   float64  `json:"surfaceThreshold"`
+		TopK               int      `json:"topK"`
+		MaxBlockChars      int      `json:"maxBlockChars"`
+		MinLeaves          int      `json:"minLeaves"`
+		MinPrompts         int      `json:"minPrompts"`
+		PromotionThreshold float64  `json:"promotionThreshold"`
+		RescueThreshold    float64  `json:"rescueThreshold"`
+		PromotionCooldown  string   `json:"promotionCooldown"` // Go duration string, e.g. "4h"
+		PendingMaxAge      string   `json:"pendingMaxAge"`     // Go duration string
+		MergeSuggestCosine float64  `json:"mergeSuggestCosine"`
+		AutoNudge          bool     `json:"autoNudge"`
+		RedactPatterns     []string `json:"redactPatterns"` // regexes scrubbed from pending bundles
+	} `json:"memory"`
 }
 
 func defaultConfig() config {
@@ -151,6 +176,29 @@ func defaultConfig() config {
 	}
 	c.Similarity.Extend = 0.55
 	c.Similarity.Branch = 0.25
+	// Typo tolerance defaults. maxDistance=2 catches realistic user typos
+	// (e.g. "envaeron" ← "environ" is two edits); the other guards
+	// (minWordLen, minEstablishedDF) keep false merges rare.
+	c.TypoTolerance.Enabled = true
+	c.TypoTolerance.MaxDistance = 2
+	c.TypoTolerance.MinWordLen = 5
+	c.TypoTolerance.MinEstablishedDF = 3
+	// Long-term memory defaults (Session A — surface layer only; candidate
+	// detection and promote/commit ship in later sessions). Safe to leave
+	// enabled: if no memory files exist yet, the surface block is silent.
+	c.Memory.Enabled = true
+	c.Memory.Dir = "memories"
+	c.Memory.SurfaceThreshold = 0.35
+	c.Memory.TopK = 2
+	c.Memory.MaxBlockChars = 250
+	c.Memory.MinLeaves = 4
+	c.Memory.MinPrompts = 3
+	c.Memory.PromotionThreshold = 1.5
+	c.Memory.RescueThreshold = 1.2
+	c.Memory.PromotionCooldown = "4h"
+	c.Memory.PendingMaxAge = "168h" // 7 days
+	c.Memory.MergeSuggestCosine = 0.6
+	c.Memory.AutoNudge = true
 	return c
 }
 
@@ -213,6 +261,76 @@ func loadConfig(path string) config {
 			}
 			if _, ok := simMap["branch"]; ok {
 				cfg.Similarity.Branch = userCfg.Similarity.Branch
+			}
+		}
+	}
+
+	// Handle nested "typoTolerance" object using the same key-presence
+	// protocol so users can set individual fields (e.g. disable with
+	// "enabled": false) without having to spell out every default.
+	if ttRaw, ok := raw["typoTolerance"]; ok {
+		var ttMap map[string]json.RawMessage
+		if json.Unmarshal(ttRaw, &ttMap) == nil {
+			if _, ok := ttMap["enabled"]; ok {
+				cfg.TypoTolerance.Enabled = userCfg.TypoTolerance.Enabled
+			}
+			if _, ok := ttMap["maxDistance"]; ok {
+				cfg.TypoTolerance.MaxDistance = userCfg.TypoTolerance.MaxDistance
+			}
+			if _, ok := ttMap["minWordLen"]; ok {
+				cfg.TypoTolerance.MinWordLen = userCfg.TypoTolerance.MinWordLen
+			}
+			if _, ok := ttMap["minEstablishedDF"]; ok {
+				cfg.TypoTolerance.MinEstablishedDF = userCfg.TypoTolerance.MinEstablishedDF
+			}
+		}
+	}
+
+	// Handle nested "memory" object with the same explicit-zero protocol.
+	if memRaw, ok := raw["memory"]; ok {
+		var memMap map[string]json.RawMessage
+		if json.Unmarshal(memRaw, &memMap) == nil {
+			if _, ok := memMap["enabled"]; ok {
+				cfg.Memory.Enabled = userCfg.Memory.Enabled
+			}
+			if _, ok := memMap["dir"]; ok {
+				cfg.Memory.Dir = userCfg.Memory.Dir
+			}
+			if _, ok := memMap["surfaceThreshold"]; ok {
+				cfg.Memory.SurfaceThreshold = userCfg.Memory.SurfaceThreshold
+			}
+			if _, ok := memMap["topK"]; ok {
+				cfg.Memory.TopK = userCfg.Memory.TopK
+			}
+			if _, ok := memMap["maxBlockChars"]; ok {
+				cfg.Memory.MaxBlockChars = userCfg.Memory.MaxBlockChars
+			}
+			if _, ok := memMap["minLeaves"]; ok {
+				cfg.Memory.MinLeaves = userCfg.Memory.MinLeaves
+			}
+			if _, ok := memMap["minPrompts"]; ok {
+				cfg.Memory.MinPrompts = userCfg.Memory.MinPrompts
+			}
+			if _, ok := memMap["promotionThreshold"]; ok {
+				cfg.Memory.PromotionThreshold = userCfg.Memory.PromotionThreshold
+			}
+			if _, ok := memMap["rescueThreshold"]; ok {
+				cfg.Memory.RescueThreshold = userCfg.Memory.RescueThreshold
+			}
+			if _, ok := memMap["promotionCooldown"]; ok {
+				cfg.Memory.PromotionCooldown = userCfg.Memory.PromotionCooldown
+			}
+			if _, ok := memMap["pendingMaxAge"]; ok {
+				cfg.Memory.PendingMaxAge = userCfg.Memory.PendingMaxAge
+			}
+			if _, ok := memMap["mergeSuggestCosine"]; ok {
+				cfg.Memory.MergeSuggestCosine = userCfg.Memory.MergeSuggestCosine
+			}
+			if _, ok := memMap["autoNudge"]; ok {
+				cfg.Memory.AutoNudge = userCfg.Memory.AutoNudge
+			}
+			if _, ok := memMap["redactPatterns"]; ok {
+				cfg.Memory.RedactPatterns = userCfg.Memory.RedactPatterns
 			}
 		}
 	}
@@ -433,6 +551,193 @@ func loadGuide(path string, maxSize int) *guide.Guide {
 	return g
 }
 
+// loadMemoryManifest reads the long-term memory manifest from disk and
+// auto-rebuilds it when the directory contents have drifted (hand-edited
+// files, vocabulary shift, files added or removed outside the binary).
+// Errors are logged rather than returned — a broken manifest must not
+// block the user's prompt.
+func loadMemoryManifest(dir string, e *tfidf.Engine) *memory.Manifest {
+	mf, errs := memory.EnsureFresh(dir, memory.NewVocabSnapshot(e))
+	for _, err := range errs {
+		fmt.Fprintf(os.Stderr, "focus-gate: memory manifest: %v\n", err)
+	}
+	if mf == nil {
+		return memory.NewManifest()
+	}
+	return mf
+}
+
+// parseDuration wraps time.ParseDuration with a zero-value fallback so
+// a missing or malformed config field never panics the hook.
+func parseDuration(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+// memorySelectConfig maps the CLI config block to the memory package's
+// selection config. Done separately from toGateConfig so the memory
+// pipeline has its own clean boundary.
+func memorySelectConfig(cfg config) memory.SelectConfig {
+	return memory.SelectConfig{
+		MinLeaves:          cfg.Memory.MinLeaves,
+		MinPrompts:         cfg.Memory.MinPrompts,
+		PromotionThreshold: cfg.Memory.PromotionThreshold,
+		RescueThreshold:    cfg.Memory.RescueThreshold,
+		Cooldown:           parseDuration(cfg.Memory.PromotionCooldown, 4*time.Hour),
+		MergeSuggestCosine: cfg.Memory.MergeSuggestCosine,
+		RedactPatterns:     cfg.Memory.RedactPatterns,
+	}
+}
+
+// guideSummariesForTree returns the subset of guide summaries whose
+// IntentID resolves to a node inside the given tree. Entries without an
+// IntentID (legacy or untracked) are skipped — SelectCandidate cares
+// about *per-tree* AI reinforcement, so attaching anonymous summaries
+// would re-introduce the global-guide leakage we're guarding against.
+//
+// O(entries × 1) with the map-membership check; called once per tree
+// per prompt, so worst case is O(entries × trees) which is bounded by
+// guide.MaxSize × MemorySize — negligible.
+func guideSummariesForTree(gd *guide.Guide, tree *forest.Tree) []string {
+	if gd == nil || tree == nil || len(gd.Entries) == 0 {
+		return nil
+	}
+	var out []string
+	for _, e := range gd.Entries {
+		if e.IntentID == "" {
+			continue
+		}
+		if _, ok := tree.Nodes[e.IntentID]; ok {
+			out = append(out, e.Summary)
+		}
+	}
+	return out
+}
+
+// attachMemoryCollector wires the long-term memory candidate collector
+// onto a Gate instance so Prune and tryMerge can produce candidates
+// inline. The returned function finalises the collector: it appends any
+// collected candidates to the pending queue on disk, deduplicated.
+//
+// Returning a finaliser rather than a side-effectful collector keeps
+// the IO off the hot classification path — the hook gets a single
+// deterministic save call at end-of-prompt.
+//
+// Guide entries are scoped per-tree at candidate time via their
+// IntentID so each candidate's floor check and fingerprint reflect only
+// the AI reinforcement that actually touched that tree, not the whole
+// guide buffer.
+func attachMemoryCollector(gt *gate.Gate, p paths, cfg config, engine *tfidf.Engine, gd *guide.Guide) func() (int, []error) {
+	if !cfg.Memory.Enabled {
+		return func() (int, []error) { return 0, nil }
+	}
+
+	selectCfg := memorySelectConfig(cfg)
+	vocab := memory.NewVocabSnapshot(engine)
+
+	// Load existing manifest entries once so SelectCandidate can suggest
+	// merge targets without re-reading per tree. Manifest drift is
+	// tolerated — a false-positive merge suggestion is harmless; the
+	// LLM ultimately picks create vs merge.
+	var existing []memory.IndexEntry
+	if mf, _ := memory.Load(p.memoryDir); mf != nil {
+		existing = mf.Entries
+	}
+
+	// Load pending queue once so Cooldowns and in-queue dedup are honoured
+	// even before any save fires.
+	maxAge := parseDuration(cfg.Memory.PendingMaxAge, 168*time.Hour)
+	pq, err := memory.LoadPending(p.dataDir, maxAge)
+	if err != nil || pq == nil {
+		pq = memory.NewPendingQueue()
+	}
+
+	var collected []*memory.Candidate
+	gt.OnTreeAtRisk = func(tree *forest.Tree, reason string) {
+		cand := memory.SelectCandidate(memory.SelectInputs{
+			Tree:            tree,
+			GuideSummaries:  guideSummariesForTree(gd, tree),
+			Vocab:           vocab,
+			DecayRate:       cfg.DecayRate,
+			Reason:          reason,
+			ExistingEntries: existing,
+			Cooldowns:       pq.Cooldowns,
+		}, selectCfg)
+		if cand != nil {
+			collected = append(collected, cand)
+		}
+	}
+
+	return func() (int, []error) {
+		if len(collected) == 0 {
+			return 0, nil
+		}
+		var errs []error
+		deduped := memory.DedupCandidates(collected, 0.85)
+		added := pq.AppendCandidates(deduped, 0.85)
+		if added == 0 {
+			return 0, nil
+		}
+		if err := pq.Save(p.dataDir); err != nil {
+			errs = append(errs, fmt.Errorf("save pending queue: %w", err))
+		}
+		return added, errs
+	}
+}
+
+// appendPendingNudge adds a one-line hint to the existing memory surface
+// block when the pending queue is non-empty. Kept as a separate helper
+// so autoNudge can be toggled without threading the pending count through
+// surfaceMemoryBlock. Zero-cost when the queue is empty — a single read
+// of the pending file's mtime could be added later if the cost shows up
+// in profiles, but the file is small and the hook is not on a hot loop.
+func appendPendingNudge(p paths, cfg config, block string) string {
+	if !cfg.Memory.Enabled {
+		return block
+	}
+	maxAge := parseDuration(cfg.Memory.PendingMaxAge, 168*time.Hour)
+	pq, err := memory.LoadPending(p.dataDir, maxAge)
+	if err != nil || pq == nil || len(pq.Candidates) == 0 {
+		return block
+	}
+	nudge := fmt.Sprintf("  (%d topic(s) queued for memory promotion — run `fg: memory promote`)\n", len(pq.Candidates))
+	if block == "" {
+		return "[Memory ↪ relevant prior context]\n" + nudge
+	}
+	return block + nudge
+}
+
+// surfaceMemoryBlock loads the memory manifest (if enabled), looks up
+// entries whose fingerprint matches the prompt vector, and renders a
+// pointer block suitable for splicing into the injected context.
+//
+// Returns the loaded manifest alongside the rendered block so the caller
+// can save it at end-of-prompt — the manifest is mutated by touch-count
+// increments on every surface, but those increments are debounced into
+// a single write per hook invocation.
+func surfaceMemoryBlock(p paths, cfg config, e *tfidf.Engine, promptVec tfidf.Vector) (*memory.Manifest, string) {
+	if !cfg.Memory.Enabled || len(promptVec) == 0 {
+		return nil, ""
+	}
+	mf := loadMemoryManifest(p.memoryDir, e)
+	result := memory.Surface(promptVec, mf, memory.SurfaceConfig{
+		Enabled:       cfg.Memory.Enabled,
+		Threshold:     cfg.Memory.SurfaceThreshold,
+		TopK:          cfg.Memory.TopK,
+		MaxBlockChars: cfg.Memory.MaxBlockChars,
+	})
+	for _, ent := range result.Selected {
+		mf.Touch(ent.ID)
+	}
+	return mf, result.Block
+}
+
 func handleStatus(p paths, cfg config) error {
 	f := loadForest(p.intentFile)
 	e := loadEngine(p.engineFile)
@@ -535,8 +840,37 @@ func handlePrompt(p paths, cfg config) error {
 		fmt.Fprintf(os.Stderr, "focus-gate: reinforced %d guide entries\n", reinforced)
 	}
 
+	// Attach the long-term memory candidate collector so Gate.Prune and
+	// Gate.tryMerge can stash at-risk trees as pending candidates. The
+	// finaliser is invoked after ProcessPrompt so collected candidates
+	// are batch-written once per hook invocation. The guide is passed
+	// whole so the collector can scope summaries to each tree's own
+	// intent nodes rather than blanket-attaching the entire guide to
+	// every candidate.
+	finaliseMemoryCandidates := attachMemoryCollector(gt, p, cfg, e, g)
+
 	// Process the new prompt
 	ctx := gt.ProcessPrompt(prompt, fmt.Sprintf("p%d", f.Meta.TotalPrompts))
+
+	// Persist any pending-memory candidates the collector gathered.
+	if added, errs := finaliseMemoryCandidates(); added > 0 {
+		for _, err := range errs {
+			fmt.Fprintf(os.Stderr, "focus-gate: memory candidate: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "focus-gate: queued %d memory candidate(s) for promotion\n", added)
+	}
+
+	// Long-term memory surface: look up memories whose fingerprint matches
+	// the prompt vector and render a pointer block before the guide. Silent
+	// when disabled, when the manifest is empty, or when no entry meets
+	// the similarity threshold.
+	memManifest, memBlock := surfaceMemoryBlock(p, cfg, e, gt.LastPromptVector())
+	if cfg.Memory.AutoNudge {
+		memBlock = appendPendingNudge(p, cfg, memBlock)
+	}
+	if memBlock != "" {
+		ctx = strings.Replace(ctx, "[/Focus]\n", memBlock+"[/Focus]\n", 1)
+	}
 
 	// Append guide context
 	guideCtx := g.Render(f)
@@ -554,6 +888,13 @@ func handlePrompt(p paths, cfg config) error {
 	}
 	if err := persist.SaveAtomic(p.guideFile, g); err != nil {
 		fmt.Fprintf(os.Stderr, "focus-gate: save guide: %v\n", err)
+	}
+	// Touch counter increments from surfacing are batched into this single
+	// manifest write at the end of the prompt.
+	if memManifest != nil && memManifest.Dirty() {
+		if err := memManifest.Save(p.memoryDir); err != nil {
+			fmt.Fprintf(os.Stderr, "focus-gate: save memory manifest: %v\n", err)
+		}
 	}
 
 	// Output context to stdout
@@ -661,5 +1002,11 @@ func toGateConfig(cfg config) gate.Config {
 		SessionTimeout:  cfg.SessionTimeout,
 		MergeSimilarity: cfg.MergeSimilarity,
 		ProjectDir:      projectDir,
+		TypoTolerance: text.CanonicalizeOpts{
+			Enabled:          cfg.TypoTolerance.Enabled,
+			MaxDistance:      cfg.TypoTolerance.MaxDistance,
+			MinWordLen:       cfg.TypoTolerance.MinWordLen,
+			MinEstablishedDF: cfg.TypoTolerance.MinEstablishedDF,
+		},
 	}
 }

@@ -11,6 +11,24 @@ type Tree struct {
 	Nodes        map[string]*Node `json:"nodes"`
 	Created      int64            `json:"created"`
 	LastAccessed int64            `json:"lastAccessed"`
+
+	// PeakScore is the highest root-decay-score this tree has ever held.
+	// Used by long-term memory candidate selection (§5.3 of the plan) to
+	// rescue trees that *were* hot but are about to be pruned. Updated
+	// whenever the caller observes a new high; never decreases.
+	// Omitempty so legacy intent.json files load with PeakScore=0, which
+	// is also the correct initial value for a freshly created tree.
+	PeakScore float64 `json:"peakScore,omitempty"`
+}
+
+// ObservePeak bumps PeakScore if score is higher than the current
+// recorded peak. Idempotent in both directions: callers can call this on
+// every Touch / score recompute without worrying about whether the
+// number has actually changed.
+func (t *Tree) ObservePeak(score float64) {
+	if score > t.PeakScore {
+		t.PeakScore = score
+	}
 }
 
 // NewTree creates a tree with a single root node containing the given content.

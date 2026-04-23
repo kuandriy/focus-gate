@@ -28,6 +28,10 @@ type Config struct {
 	// refs. When non-empty, refs not present on disk relative to this dir
 	// are dropped before being stored on a node. Empty disables validation.
 	ProjectDir string `json:"-"`
+	// TypoTolerance controls whether novel tokens get canonicalised against
+	// existing TF-IDF vocabulary to absorb misspellings. Disabled zero value
+	// preserves the original tokenizer behaviour exactly.
+	TypoTolerance text.CanonicalizeOpts `json:"typoTolerance"`
 }
 
 // DefaultConfig returns sensible defaults.
@@ -102,7 +106,28 @@ type Gate struct {
 	// omitted from the header.
 	lastCls     Classification
 	haveLastCls bool
+
+	// lastPromptVec caches the TF-IDF vector of the most recent prompt so
+	// hook callers can reuse it for downstream features (e.g. long-term
+	// memory surfacing) without re-tokenising. Nil before the first
+	// ProcessPrompt or when the prompt produced no usable signal.
+	lastPromptVec tfidf.Vector
+
+	// OnTreeAtRisk is an optional callback invoked just before a tree's
+	// content is at risk of being lost — right before Forest.Prune runs
+	// (reason="prune", called once per tree) and right before tryMerge
+	// absorbs the smaller tree (reason="merge", called with the smaller
+	// tree). The callback is expected to inspect the tree's state and
+	// persist any downstream artefacts (e.g. long-term memory
+	// candidates). Kept as a callback rather than a direct dependency so
+	// the Gate package stays free of the memory package's imports.
+	OnTreeAtRisk func(tree *forest.Tree, reason string)
 }
+
+// LastPromptVector returns the TF-IDF vector of the most recent prompt
+// that ProcessPrompt classified. Returns nil if no prompt has been
+// processed yet or the most recent prompt was terse/empty.
+func (g *Gate) LastPromptVector() tfidf.Vector { return g.lastPromptVec }
 
 // New creates a Gate from existing forest and engine state.
 func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
@@ -136,21 +161,55 @@ func (g *Gate) recordClassification(cls Classification, prompt string) {
 	})
 }
 
+// tokenize runs the canonicalising tokenizer so incoming prompts, node
+// content, bubble-up abstractions, and guide summaries all map to the same
+// vocabulary. When TypoTolerance is disabled this collapses to plain
+// text.Tokenize, so the behaviour is a pure superset of the previous path.
+func (g *Gate) tokenize(s string) []string {
+	return text.TokenizeWithCorpus(s, g.Engine.DocFreq, g.Config.TypoTolerance)
+}
+
+// updatePeaks walks every tree and bumps its all-time PeakScore. Idempotent
+// and cheap — ObservePeak only writes when the new score beats the stored
+// peak. Called before any mutation that could absorb or delete a tree
+// (prune, tryMerge) so the OnTreeAtRisk observer sees the latest figure.
+// GenerateContext also calls ObservePeak on its own scoring pass; duplicating
+// the work there is harmless and keeps peak tracking on the simple
+// read-only path too.
+func (g *Gate) updatePeaks() {
+	if len(g.Forest.Trees) == 0 {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for _, t := range g.Forest.Trees {
+		root := t.Root()
+		if root == nil {
+			continue
+		}
+		t.ObservePeak(root.Score(now, g.Config.DecayRate))
+	}
+}
+
 // nodeVec returns the TF-IDF vector for a node, caching the result.
 // Reduces classify() cost from O(nodes × tokenize) to O(nodes × dot_product)
 // after initial computation. Cache entries are invalidated in bubbleUp.
+//
+// Uses the canonicalising tokenizer (via g.tokenize) so that a node whose
+// content contains a typo is still vectorised in the same space as an
+// incoming correctly-spelled prompt — without this, the cosine comparison
+// would under-score related nodes whenever the underlying text drifted.
 func (g *Gate) nodeVec(nodeID string, content string) tfidf.Vector {
 	if v, ok := g.vecCache[nodeID]; ok {
 		return v
 	}
-	v := g.Engine.Vectorize(content)
+	v := g.Engine.VectorizeTokens(g.tokenize(content))
 	g.vecCache[nodeID] = v
 	return v
 }
 
 // ProcessPrompt classifies a prompt, applies it to the forest, and returns context.
 func (g *Gate) ProcessPrompt(prompt string, source string) string {
-	tokens := text.Tokenize(prompt)
+	tokens := g.tokenize(prompt)
 
 	// Session boundary detection: if the gap since last prompt exceeds the
 	// timeout, penalize all existing tree scores so stale context doesn't
@@ -159,6 +218,7 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	g.applySessionBoundary()
 
 	vec := g.Engine.VectorizeTokens(tokens)
+	g.lastPromptVec = vec
 
 	// Decide the action. Terse prompts (short and/or missing IDF signal) are
 	// routed to ActionContinue/ActionSkip before calling the pure classifier,
@@ -206,9 +266,29 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 
 	// Prune if needed
 	if g.Forest.NodeCount() > g.Config.MemorySize {
+		// Refresh all-time peak scores *before* firing the at-risk
+		// observer so long-term memory's rescue path (which compares a
+		// tree's PeakScore against RescueThreshold) sees an up-to-date
+		// figure. Without this, GenerateContext is the only site that
+		// calls ObservePeak — and on a fresh tree that got hot and is
+		// about to be pruned in the same cycle, the peak would still be
+		// 0 when SelectCandidate reads it, so rescue would never trigger.
+		g.updatePeaks()
+		// Give the at-risk observer a chance to persist anything worth
+		// preserving (long-term memory candidates) before we mutate.
+		// Fires once per tree regardless of which leaves actually get
+		// removed — SelectCandidate filters by score so trees that don't
+		// qualify produce nothing.
+		if g.OnTreeAtRisk != nil {
+			for _, t := range g.Forest.Trees {
+				g.OnTreeAtRisk(t, "prune")
+			}
+		}
 		removed := g.Forest.Prune(g.Config.MemorySize, g.Config.DecayRate)
 		for _, content := range removed {
-			g.Engine.RemoveDocument(text.Tokenize(content))
+			// Tokenise via canonicaliser so pruning decrements the same
+			// DocFreq keys that AddDocument inserted at indexing time.
+			g.Engine.RemoveDocument(g.tokenize(content))
 		}
 	}
 
@@ -216,6 +296,10 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	// have drifted toward the same topic and merge the smaller into the larger.
 	// Skip after a continuation — no new semantic signal to justify merging.
 	if cls.Action != ActionContinue {
+		// Same rationale as the prune path: keep PeakScore current so
+		// the tree's history is visible to OnTreeAtRisk("merge") before
+		// its identity is absorbed.
+		g.updatePeaks()
 		g.tryMerge()
 	}
 
@@ -459,7 +543,7 @@ func (g *Gate) bubbleUp(tree *forest.Tree, nodeID string) {
 		if child == nil {
 			continue
 		}
-		tokens := text.Tokenize(child.Content)
+		tokens := g.tokenize(child.Content)
 		seen := make(map[string]bool, len(tokens))
 		for _, t := range tokens {
 			if !seen[t] {
@@ -537,7 +621,11 @@ func (g *Gate) GenerateContext() string {
 	scored := make([]scoredTree, len(g.Forest.Trees))
 	now := g.Forest.Trees[0].LastAccessed
 	for i, t := range g.Forest.Trees {
-		scored[i] = scoredTree{t, t.Root().Score(now, g.Config.DecayRate)}
+		s := t.Root().Score(now, g.Config.DecayRate)
+		scored[i] = scoredTree{t, s}
+		// Track all-time peak — used by long-term memory candidate
+		// selection to rescue cooling-but-once-hot trees from prune.
+		t.ObservePeak(s)
 	}
 	sort.Slice(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
@@ -775,6 +863,15 @@ func (g *Gate) tryMerge() {
 		bestI, bestJ = bestJ, bestI
 	}
 
+	// Fire the at-risk observer on the smaller tree before its identity
+	// is absorbed. This is the prime rescue case for long-term memory —
+	// a tree that was coherent enough to warrant its own bubble-up is
+	// about to lose that coherence, so its state should be snapshotted
+	// while it still stands.
+	if g.OnTreeAtRisk != nil {
+		g.OnTreeAtRisk(small, "merge")
+	}
+
 	// Move all non-root nodes from small under large's root (flat re-parent).
 	// Using Nodes map directly covers leaves AND interior nodes at any depth,
 	// preventing content loss in trees deeper than root→leaf.
@@ -819,13 +916,13 @@ func (g *Gate) ReinforceFromGuide(gd *guide.Guide) int {
 	reinforced := 0
 
 	for _, entry := range unreinforced {
-		tokens := text.Tokenize(entry.Summary)
+		tokens := g.tokenize(entry.Summary)
 		if len(tokens) == 0 {
 			entry.Reinforced = true
 			continue
 		}
 
-		responseVec := g.Engine.Vectorize(strings.Join(tokens, " "))
+		responseVec := g.Engine.VectorizeTokens(tokens)
 
 		// Find the best-matching tree root by pure cosine similarity.
 		bestScore := 0.0

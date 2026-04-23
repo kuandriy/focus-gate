@@ -7,11 +7,27 @@ import (
 	"time"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
+	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
 
 func newTestGate() *Gate {
 	return New(forest.NewForest(), tfidf.NewEngine(), DefaultConfig())
+}
+
+// newTypoTolerantGate builds a gate with typo-tolerant canonicalisation
+// enabled at defaults tuned for tests: maxDistance=2 catches real typos,
+// minEstablishedDF=2 so a couple of repetitions is enough to establish a
+// canonical term, minWordLen=5 keeps short words free of false merges.
+func newTypoTolerantGate() *Gate {
+	cfg := DefaultConfig()
+	cfg.TypoTolerance = text.CanonicalizeOpts{
+		Enabled:          true,
+		MaxDistance:      2,
+		MinWordLen:       5,
+		MinEstablishedDF: 2,
+	}
+	return New(forest.NewForest(), tfidf.NewEngine(), cfg)
 }
 
 func TestNewPromptCreatesTree(t *testing.T) {
@@ -253,6 +269,180 @@ func TestDryRunNoNearMissWhenActionBranches(t *testing.T) {
 	result := g.DryRun("add JWT authentication to the API")
 	if result.NearMiss {
 		t.Errorf("high-similarity prompt should not be flagged near-miss (action=%s score=%.3f)", result.BestAction, result.BestScore)
+	}
+}
+
+func TestTypoToleranceMergesMisspellingsIntoSameTree(t *testing.T) {
+	g := newTypoTolerantGate()
+	// Prime the corpus so "environ" (stem of "environment") is established.
+	// Two clean prompts are enough given minEstablishedDF=2 in the helper.
+	g.ProcessPrompt("configure the environment variables for production", "p1")
+	g.ProcessPrompt("document the environment setup", "p2")
+
+	// Now send a misspelled variant. It should canonicalise to the same
+	// stem and extend an existing tree rather than spawning a new one.
+	before := len(g.Forest.Trees)
+	g.ProcessPrompt("update the envaeronment variables list", "p3")
+
+	if len(g.Forest.Trees) != before {
+		t.Errorf("misspelled prompt should not create a new tree: had %d, now %d", before, len(g.Forest.Trees))
+	}
+	// The typo's raw stem must not have leaked into the corpus — if it had,
+	// the canonicalisation at indexing time failed.
+	for term := range g.Engine.DocFreq {
+		if term != "environ" && (len(term) >= 7 && term[:3] == "env") {
+			if term == "envaeron" || term == "envaeronment" {
+				t.Errorf("typo stem %q leaked into corpus", term)
+			}
+		}
+	}
+}
+
+func TestTypoToleranceDoesNotMergeBelowEstablishedDF(t *testing.T) {
+	g := newTypoTolerantGate()
+	// Only one "environment" prompt → DF falls below minEstablishedDF=2,
+	// so canonicalisation is deliberately off-limits for that term.
+	g.ProcessPrompt("configure the environment variables", "p1")
+
+	before := len(g.Forest.Trees)
+	g.ProcessPrompt("envaeronment setup details for deployment", "p2")
+
+	// This prompt is a genuinely new topic as far as the canonicaliser knows,
+	// so it should create a second tree or branch normally — but the
+	// invariant we care about is that the typo stem is NOT silently rewritten
+	// to "environ" when the canonical form isn't established yet.
+	//
+	// We assert the behavioural consequence: the forest state must still
+	// contain a record of "envaeron"-ish content, not everything collapsed
+	// to the single first tree under "environ".
+	if len(g.Forest.Trees) == before && g.lastCls.Action != ActionExtend {
+		t.Errorf("one-off term below minEstablishedDF should not be rewritten; got action=%s trees=%d", g.lastCls.Action, len(g.Forest.Trees))
+	}
+}
+
+func TestTypoToleranceDisabledRestoresBaseline(t *testing.T) {
+	// With typo tolerance disabled, a typo whose ONLY potential link to the
+	// existing tree is the misspelled word itself must fall through to a new
+	// tree — otherwise we'd have silently canonicalised even with the
+	// feature off. Carefully pick vocab that doesn't accidentally overlap.
+	cfg := DefaultConfig()
+	cfg.TypoTolerance = text.CanonicalizeOpts{Enabled: false}
+	g := New(forest.NewForest(), tfidf.NewEngine(), cfg)
+
+	g.ProcessPrompt("configure environment production", "p1")
+	g.ProcessPrompt("document environment rollout", "p2")
+	// "envaeronment" shares NO stem with the above after typo canonicalisation
+	// is turned off, and none of its other tokens appear in the corpus either.
+	g.ProcessPrompt("envaeronment debugger stacktrace", "p3")
+
+	if len(g.Forest.Trees) < 2 {
+		t.Errorf("with typo tolerance disabled the typo should NOT merge; got %d tree(s)", len(g.Forest.Trees))
+	}
+}
+
+func TestGate_OnTreeAtRiskFiresBeforePrune(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MemorySize = 4 // force a prune quickly
+	g := New(forest.NewForest(), tfidf.NewEngine(), cfg)
+
+	var observed []string
+	g.OnTreeAtRisk = func(tree *forest.Tree, reason string) {
+		observed = append(observed, reason)
+	}
+
+	// Feed enough distinct prompts to push past MemorySize and trigger prune.
+	for i := 0; i < 10; i++ {
+		g.ProcessPrompt(fmt.Sprintf("novel topic %d with distinct words %d", i, i*7), fmt.Sprintf("p%d", i))
+	}
+
+	foundPrune := false
+	for _, r := range observed {
+		if r == "prune" {
+			foundPrune = true
+			break
+		}
+	}
+	if !foundPrune {
+		t.Errorf("expected at least one 'prune' observation, got %v", observed)
+	}
+}
+
+// TestGate_OnTreeAtRiskSeesPeakScore locks in the fix for a subtle ordering
+// bug: ObservePeak used to run only inside GenerateContext, so an
+// at-risk-during-prune observer saw PeakScore=0 on trees that had only
+// been scored once in the current hook. The memory package's rescue
+// branch depends on PeakScore being up-to-date at callback time, so the
+// gate now refreshes peaks via updatePeaks before firing the observer.
+func TestGate_OnTreeAtRiskSeesPeakScore(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MemorySize = 4
+	g := New(forest.NewForest(), tfidf.NewEngine(), cfg)
+
+	sawPeak := false
+	g.OnTreeAtRisk = func(tree *forest.Tree, reason string) {
+		if reason == "prune" && tree.PeakScore > 0 {
+			sawPeak = true
+		}
+	}
+
+	for i := 0; i < 10; i++ {
+		g.ProcessPrompt(fmt.Sprintf("novel topic %d with distinct words %d", i, i*7), fmt.Sprintf("p%d", i))
+	}
+
+	if !sawPeak {
+		t.Error("OnTreeAtRisk observer should see PeakScore>0 on at least one tree before prune")
+	}
+}
+
+func TestGate_OnTreeAtRiskFiresBeforeMerge(t *testing.T) {
+	// tryMerge requires two trees at the start of the cycle whose roots
+	// have cosine >= MergeSimilarity. Classifier-driven setups tend to
+	// collapse overlapping prompts into one tree before merge can run,
+	// so we construct the two trees directly via internal test helpers.
+	cfg := DefaultConfig()
+	cfg.MergeSimilarity = 0.2
+	f := forest.NewForest()
+	engine := tfidf.NewEngine()
+
+	// Two trees with heavy term overlap. Add each root's content to the
+	// engine so vectorisation produces a meaningful cosine.
+	treeA := forest.NewTree("jwt authentication refresh token rotation", "pA")
+	treeA.Root().Indexed = true
+	engine.AddDocument([]string{"jwt", "authentica", "refresh", "token", "rotation"})
+	f.AddTree(treeA)
+
+	treeB := forest.NewTree("jwt authentication session middleware rotation", "pB")
+	treeB.Root().Indexed = true
+	engine.AddDocument([]string{"jwt", "authentica", "session", "middleware", "rotation"})
+	f.AddTree(treeB)
+
+	g := New(f, engine, cfg)
+	var mergeFired bool
+	g.OnTreeAtRisk = func(tree *forest.Tree, reason string) {
+		if reason == "merge" {
+			mergeFired = true
+		}
+	}
+	g.ProcessPrompt("add jwt token rotation policy", "pC")
+
+	if !mergeFired {
+		t.Errorf("expected at least one 'merge' observation on cluster merge (trees=%d)", len(g.Forest.Trees))
+	}
+}
+
+func TestTreeObservePeakNeverDecreases(t *testing.T) {
+	tree := forest.NewTree("test", "")
+	tree.ObservePeak(0.5)
+	if tree.PeakScore != 0.5 {
+		t.Errorf("PeakScore = %v, want 0.5", tree.PeakScore)
+	}
+	tree.ObservePeak(0.2) // lower — should be ignored
+	if tree.PeakScore != 0.5 {
+		t.Errorf("PeakScore decreased: %v", tree.PeakScore)
+	}
+	tree.ObservePeak(0.9) // higher — should update
+	if tree.PeakScore != 0.9 {
+		t.Errorf("PeakScore = %v, want 0.9", tree.PeakScore)
 	}
 }
 

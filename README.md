@@ -17,6 +17,7 @@ Zero external dependencies. Single binary. Built entirely on Go's standard libra
   - [In-Chat Commands](#in-chat-commands)
   - [CLI Flags](#cli-flags)
 - [Algorithms](#algorithms)
+- [Long-Term Memory](#long-term-memory)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [License](#license)
@@ -182,9 +183,14 @@ Type any `/focus` command (CLI) or the equivalent `fg:` alias (works in every en
 | `/focus last` | `fg: last` | Last classifications (action + similarity score) |
 | `/focus score "prompt"` | `fg: score "prompt"` | Dry-run classification — see how a prompt would be scored without sending it |
 | `/focus health` | `fg: health` | System diagnostics — memory pressure, tree balance, staleness, pruning forecast |
+| `/focus memory list` | `fg: memory list` | List long-term memory files with touch counts (see [Long-Term Memory](#long-term-memory)) |
+| `/focus memory show <id>` | `fg: memory show <id>` | Pretty-print one memory's frontmatter + body |
+| `/focus memory pending` | `fg: memory pending` | Queue of candidates awaiting LLM promotion |
+| `/focus memory discard <id\|all>` | `fg: memory discard <id\|all>` | Clear pending candidates without promoting |
+| `/focus memory health` | `fg: memory health` | Manifest counts, stale refs, soft warnings |
 | `/focus help` | `fg: help` | List all available commands |
 
-> **Why the `fg:` alias?** The `/focus` slash form works in the Claude Code CLI. In the VSCode extension the leading `/` is intercepted by the slash-command picker before the hook sees it, so the short non-slash alias `fg:` is provided. Both route to the same handler; pick whichever fits your environment. The following examples use `fg:` (since it works everywhere), but every output is identical under `/focus`.
+> **Two invocation paths.** `/focus <sub>` is a registered Claude Code slash command defined in [.claude/commands/focus.md](.claude/commands/focus.md); it runs the binary in `--cmd` mode and returns output inline. `fg: <sub>` is intercepted by the `UserPromptSubmit` hook itself and works in any environment where the hook runs, with zero custom-command setup. Both route to the same handler. The examples below use `fg:` (it's the bedrock); every output is identical under `/focus`.
 
 #### Example: `fg: status`
 
@@ -437,6 +443,166 @@ Every prompt is scanned for file paths — either explicit (`src/auth/middleware
 
 ---
 
+## Long-Term Memory
+
+Focus Gate's in-session forest is working memory: pruning is correct for one-off prompts but destructive for topics the user will return to — project conventions, recurring debugging patterns, "we did X because Y" decisions. **Long-term memory catches the valuable subset before pruning erases it, distills it into a small set of Markdown files, and replays pointers to those files into future prompts where they are relevant.**
+
+The distinction from agentic *skills* is deliberate: memories **describe** (this is how it was done, why, what bit us), they do **not prescribe** (do it this way). The AI decides whether to act on a surfaced memory in the context of the current prompt.
+
+### Design invariants
+
+1. **Focus Gate never calls an LLM directly.** Single binary, zero network, zero external dependencies, fully deterministic. The LLM work happens in the host (Claude Code or the CLI) using its own tools — Read, Write, Edit, Bash. Focus Gate *produces* structured prompts and *validates* structured replies.
+2. **Memories are non-restrictive.** Surfaced as titled pointers (path + title + cosine similarity), never inlined as bodies on every prompt, never phrased as imperatives.
+
+### Three-stage pipeline
+
+```
+A. SELECT  (Go, every prune cycle)
+     Evaluate trees about to lose content. Bundle valuable ones as
+     candidates. Append to pending_memories.json. Continue prune.
+
+B. WRITE   (LLM, via slash command)
+     User runs fg: memory promote. Focus Gate emits pending + existing
+     manifest + instruction block. AI replies with fg: memory commit
+     <json>. Focus Gate validates, stamps metadata, writes memory files.
+
+C. SURFACE (Go, every prompt)
+     Cosine-match prompt vector against manifest fingerprints. Inject
+     top-K titles + paths into the Focus block. Touch counter bumps.
+```
+
+Stages A and C are live today. Stage B (promote/commit) is planned — see [docs/LONG_TERM_MEMORY_PLAN.md](docs/LONG_TERM_MEMORY_PLAN.md) §7 for the slash protocol and §14 Session C for rollout.
+
+### Memory file format
+
+One Markdown file per memory at `<projectDataDir>/memories/<id>.md`:
+
+```markdown
+---
+schemaVersion: "1"
+id: "mem_20260422_a8c3f1"
+title: "JWT authentication with refresh-token rotation"
+sources: ["tree_b21f"]
+refs: ["cmd/api/auth.go", "internal/session/store.go"]
+created: "2026-04-22T14:01:00Z"
+updated: "2026-04-22T14:01:00Z"
+topTerms: ["jwt", "session", "refresh", "token", "middleware"]
+fingerprint: "jwt:0.4821 session:0.3912 refresh:0.3654 token:0.3201 ..."
+vocabHash: "ed96811f47add21e"
+touchedBy: 7
+---
+
+## What we did
+Used JWT with RS256, 15-minute access tokens rotated on /auth/refresh.
+
+## Why
+RS256 over HS256 because multi-service rotation needs asymmetric keypairs.
+
+## Pitfalls
+Clock skew between services had to be tolerated up to 30s.
+
+## Skills (historical, not prescriptive)
+- Signing keys at `internal/auth/keys/`.
+- Middleware short-circuits on `Authorization: Bearer`; missing header = 401.
+```
+
+**Two sections required:** `## What we did` and `## Why`. Everything else is free-form. Binary-managed fields (`created`, `updated`, `topTerms`, `fingerprint`, `vocabHash`, `touchedBy`) are recomputed on every write — whatever the LLM returns for them is ignored.
+
+### Lifecycle — what you'll see
+
+Below is what happens end-to-end once you've been working in a project long enough for the forest to prune. None of this requires manual intervention beyond running the promotion slash command.
+
+**1. A substantive topic gets identified for preservation.** When a tree about to be pruned (or absorbed by cluster-merge) meets the score + floor thresholds, a candidate record is written to `<projectDataDir>/pending_memories.json`. You'll see a one-line nudge appear in the Focus block:
+
+```
+[Memory ↪ relevant prior context]
+  mem_20260420_a1b2c3 [sim 0.68] Auth & session model
+    → memories/mem_20260420_a1b2c3.md
+  (1 topic(s) queued for memory promotion — run `fg: memory promote`)
+```
+
+**2. User promotes.** Running `fg: memory promote` (Session C — not yet shipped) emits the pending candidates + existing memory manifest + an instruction block telling the AI to reply with `fg: memory commit <fenced-json>`. The AI drafts Markdown bodies, decides merge-vs-create per candidate, and Focus Gate validates and persists.
+
+**3. A related future prompt surfaces the memory.** When a later prompt's cosine against the manifest fingerprint clears `memory.surfaceThreshold` (default 0.35), the Focus block gets a titled pointer. The AI reads the file on demand using its own Read tool — Focus Gate never inlines memory bodies.
+
+### Example: `fg: memory pending`
+
+```
+=== Pending Memory Candidates ===
+  Queue: 2 candidate(s), last updated 5m ago
+
+  TEMPID                              REASON  ACTION    ABSTRACTION
+  cand_20260423_145626_moblu0jw       prune   merge→mem_20260420_a1b2...  token | authentica | session | jwt
+  cand_20260423_150901_mobmuf05       merge   create    migrat | schema | user | email
+
+Run `fg: memory promote` to generate an LLM-ready bundle (Session C).
+Run `fg: memory discard <tempId|all>` to clear entries manually.
+```
+
+### Example: `fg: memory list`
+
+```
+=== Memories ===
+  Directory: ~/.focus-gate/<slug>/memories
+  Total: 3, manifest rebuilt 12m ago
+
+  ID                          TOUCH   UPDATED       TITLE
+  mem_20260420_a1b2c3         14      3.2h ago      Auth & session model
+  mem_20260418_b71e02         8       1.8d ago      Test harness conventions
+  mem_20260416_c93d14         2       5.1d ago      HTTP error-shape decision tree
+```
+
+### Slash commands
+
+| Command | Purpose |
+|:---|:---|
+| `fg: memory list` | Table of all memories (id, touches, updated, title) |
+| `fg: memory show <id-or-prefix>` | Pretty-print one memory's frontmatter + body |
+| `fg: memory pending` | Queued candidates awaiting promotion |
+| `fg: memory discard <tempId\|all>` | Clear pending without promoting |
+| `fg: memory health` | Counts, stale-ref warnings, manifest state |
+| `fg: memory promote` *(Session C)* | Render pending + manifest + LLM instructions |
+| `fg: memory commit <json>` *(Session C)* | Persist the LLM's commit payload |
+| `fg: memory forget <id>` *(Session C)* | Delete a memory file + manifest entry |
+
+All `/focus memory ...` equivalents route to the same handlers.
+
+### Memory configuration
+
+| Parameter | Default | Description |
+|:---|:---:|:---|
+| `memory.enabled` | `true` | Master switch. `false` → no detection, no surface, slash subcommands respond "disabled." |
+| `memory.dir` | `"memories"` | Sub-directory of the project data dir where files live. |
+| `memory.surfaceThreshold` | 0.35 | Minimum cosine for a memory to surface on a prompt. |
+| `memory.topK` | 2 | Max memories surfaced per prompt. |
+| `memory.maxBlockChars` | 250 | Soft cap on the rendered surface-block length. |
+| `memory.minLeaves` | 4 | Floor: tree must have this many real leaves to qualify as a candidate. |
+| `memory.minPrompts` | 3 | Floor: tree must have this many indexed prompt contributions. |
+| `memory.promotionThreshold` | 1.5 | Minimum `candidateScore` to queue a candidate. |
+| `memory.rescueThreshold` | 1.2 | Trees below the score threshold but with historical `PeakScore` above this are rescued on prune (not on merge). |
+| `memory.promotionCooldown` | `"4h"` | Per-tree cooldown preventing re-promotion storms. |
+| `memory.pendingMaxAge` | `"168h"` | Candidates older than this are dropped from the queue on load. |
+| `memory.mergeSuggestCosine` | 0.6 | Threshold at which a candidate's fingerprint is suggested to merge into an existing memory. |
+| `memory.autoNudge` | `true` | Append the "`N topic(s) queued…`" line to the Focus block when pending is non-empty. |
+
+### Tuning memory
+
+- **Memories never surface?** Lower `memory.surfaceThreshold` to 0.20 and test with `fg: memory list` to see which memories are eligible. Or raise TF-IDF signal by writing memories with richer `## What we did` sections.
+- **Too many candidates queuing?** Raise `memory.minLeaves` to 6 and `memory.promotionThreshold` to 2.0. The defaults are lenient to make Session A/B feel live; production sessions may want tighter filters.
+- **Noisy surface blocks?** Lower `memory.topK` to 1 or raise `memory.maxBlockChars` to make the single entry more descriptive.
+- **Feature blocks feel flaky?** Set `"memory": { "enabled": false }` to revert to pre-memory behaviour exactly.
+
+### What Focus Gate does NOT do (explicit anti-goals)
+
+- **No LLM HTTP client in Go.** Stage B is always slash-mediated. If a future version wants direct LLM calls, that's a separate feature behind a separate flag — the core invariant holds.
+- **No body inlining at surface time.** Always pointers + titles + similarity. `contextLimit` stays the same; memory never balloons the Focus block.
+- **No automatic memory deletion.** Stale → flagged in `fg: memory health`. Removal is always a deliberate user action via `fg: memory forget`.
+- **No cross-project memories** in v1. Per-project directories only.
+
+See [docs/LONG_TERM_MEMORY_PLAN.md](docs/LONG_TERM_MEMORY_PLAN.md) for the full design — invariants, detailed stage contracts, edge cases, test matrix, and rollout plan.
+
+---
+
 ## Configuration
 
 Configuration resolution order (first match wins):
@@ -457,7 +623,28 @@ Example `config.json`:
   "maxRefsPerNode": 5,
   "guideSize": 15,
   "sessionTimeout": 4.0,
-  "mergeSimilarity": 0.6
+  "mergeSimilarity": 0.6,
+  "typoTolerance": {
+    "enabled": true,
+    "maxDistance": 2,
+    "minWordLen": 5,
+    "minEstablishedDF": 3
+  },
+  "memory": {
+    "enabled": true,
+    "dir": "memories",
+    "surfaceThreshold": 0.35,
+    "topK": 2,
+    "maxBlockChars": 250,
+    "minLeaves": 4,
+    "minPrompts": 3,
+    "promotionThreshold": 1.5,
+    "rescueThreshold": 1.2,
+    "promotionCooldown": "4h",
+    "pendingMaxAge": "168h",
+    "mergeSuggestCosine": 0.6,
+    "autoNudge": true
+  }
 }
 ```
 
@@ -475,6 +662,23 @@ Only fields present in the file override defaults. A field explicitly set to `0`
 | `guideSize` | 15 | Maximum AI response entries tracked |
 | `sessionTimeout` | 4.0 | Hours of inactivity before session boundary halves frequencies. `0` disables. |
 | `mergeSimilarity` | 0.6 | Cosine threshold for cluster merging of similar trees. `0` disables. |
+| `typoTolerance.enabled` | `true` | Rewrite novel tokens to the nearest established corpus term (see below). `false` = no canonicalization. |
+| `typoTolerance.maxDistance` | 2 | Max Levenshtein edits between a novel token and the term it may be rewritten to. |
+| `typoTolerance.minWordLen` | 5 | Tokens shorter than this (after stemming) are never rewritten — prevents collisions like `auth` ↔ `each`. |
+| `typoTolerance.minEstablishedDF` | 3 | A corpus term must appear in at least this many prior prompts before it can be a rewrite target. Blocks early-session cementing of wrong canonical forms. |
+| `memory.*` | see above | Long-term memory parameters. Full table in the [Long-Term Memory](#long-term-memory) section. |
+
+### Typo Tolerance
+
+When the user types `envaeronment` after having already said `environment` a few times, Focus Gate canonicalizes the new token to the established one using Levenshtein edit distance. The canonicalization happens at tokenize time — the typo never enters the TF-IDF corpus, so `engine.json` stays clean and repeated typos of the same word keep remapping to the same canonical stem. No spell-check dictionary, no external dependencies.
+
+Guards:
+
+- Only tokens **shorter than `minWordLen`** characters (default 5) are considered — short words like `auth`, `each`, `run` are too prone to false merges.
+- Only rewrites toward terms **already seen `minEstablishedDF` times** (default 3) — a single-occurrence term cannot become a canonical attractor.
+- **Maximum edit distance** (default 2) is tight enough to catch realistic typos (`dificult` → `difficult`, `envaeron` → `environ`) without merging genuinely different words.
+
+Set `"typoTolerance": { "enabled": false }` to disable the feature completely and restore the original tokenizer behaviour.
 
 ### Tuning
 
@@ -482,6 +686,8 @@ Only fields present in the file override defaults. A field explicitly set to `0`
 - **Related prompts keep splitting?** Lower `similarity.branch` (e.g. 0.20) or lower `mergeSimilarity` (e.g. 0.5)
 - **Old topics persist too long?** Raise `decayRate` (e.g. 0.10) or lower `sessionTimeout`
 - **Memory fills too quickly?** Raise `memorySize` (e.g. 200)
+- **Typos creating duplicate trees?** Raise `typoTolerance.maxDistance` to 3 if you spell aggressively wrong; lower `minEstablishedDF` to 2 if your sessions are short.
+- **Typos silently merging unrelated words?** Raise `minWordLen` to 6 or `minEstablishedDF` to 5, or lower `maxDistance` to 1.
 - **Unbounded growth concern?** If `sessionTimeout=0` *and* `memorySize` is very high, `engine.json` can grow indefinitely because pruning is what limits the TF-IDF corpus. Keep at least one of the two bounded.
 
 ---
@@ -491,12 +697,13 @@ Only fields present in the file override defaults. A field explicitly set to `0`
 ```
 cmd/focus/          Entry point (CLI, stdin/stdout, inspect/dry-run, /focus commands)
 internal/
-  text/             Tokenizer, stemmer, stop words, file-ref extraction
+  text/             Tokenizer, stemmer, stop words, file-ref extraction, typo canonicalizer
   tfidf/            TF-IDF engine, sparse vectors, cosine similarity
-  forest/           Node, Tree, Forest, heap-based pruning
+  forest/           Node, Tree, Forest, heap-based pruning, peak-score tracking
   gate/             Focus Gate classifier (classify, apply, bubble-up, merge, dry-run)
   guide/            AI response tracking (ring buffer + forest reinforcement)
-  persist/          Atomic JSON persistence (Windows-safe, .tmp recovery, schema version)
+  memory/           Long-term memory (Memory, Manifest, Surface, candidate selection, pending queue)
+  persist/          Atomic JSON + raw-bytes persistence, schema version, flock
 ```
 
 Data is persisted as JSON in a per-project data directory. Each project (keyed by `sha256(cwd)[:12]`) gets its own namespace under `~/.focus-gate/<slug>/`, so state never leaks between projects. Override with `--data-dir` or `$FOCUS_GATE_DATA_DIR`.
@@ -514,6 +721,8 @@ All `persist.Load` errors are logged to stderr rather than silently discarded �
 | `intent.json` | Intent forest — what the user is asking about |
 | `engine.json` | TF-IDF document frequency counts |
 | `guide.json` | AI response summaries with intent links and reinforcement state |
+| `pending_memories.json` | Append-only queue of candidates awaiting LLM promotion (see [Long-Term Memory](#long-term-memory)) |
+| `memories/` | Long-term memory Markdown files + `index.json` manifest |
 
 ---
 
