@@ -32,20 +32,33 @@ type Config struct {
 	// existing TF-IDF vocabulary to absorb misspellings. Disabled zero value
 	// preserves the original tokenizer behaviour exactly.
 	TypoTolerance text.CanonicalizeOpts `json:"typoTolerance"`
+	// TerseTokenThreshold is the maximum post-tokenization length for which
+	// a prompt with no IDF signal is treated as a continuation rather than
+	// a new tree. Default 2 routes "fix", "yes", "run it" to ActionContinue
+	// while letting genuinely-new 5-word topics (vocabulary-novel) fall
+	// through as ActionNew. Zero falls back to the default; users who want
+	// one-token continuations can set it to 1.
+	TerseTokenThreshold int `json:"terseTokenThreshold"`
+	// SublinearTF flips the engine's term-frequency formula from linear
+	// (count/total) to sublinear (1 + log2(count)). Standard IR practice
+	// to dampen repeated-term dominance. Off by default — opt-in until
+	// validated against a user's corpus.
+	SublinearTF bool `json:"sublinearTF"`
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ExtendThreshold: 0.55,
-		BranchThreshold: 0.25,
-		BubbleUpTerms:   6,
-		MaxRefsPerNode:  5,
-		MemorySize:      100,
-		DecayRate:       0.05,
-		ContextLimit:    600,
-		SessionTimeout:  4.0,
-		MergeSimilarity: 0.6,
+		ExtendThreshold:     0.55,
+		BranchThreshold:     0.25,
+		BubbleUpTerms:       6,
+		MaxRefsPerNode:      5,
+		MemorySize:          100,
+		DecayRate:           0.05,
+		ContextLimit:        600,
+		SessionTimeout:      4.0,
+		MergeSimilarity:     0.6,
+		TerseTokenThreshold: 2,
 	}
 }
 
@@ -129,8 +142,14 @@ type Gate struct {
 // processed yet or the most recent prompt was terse/empty.
 func (g *Gate) LastPromptVector() tfidf.Vector { return g.lastPromptVec }
 
-// New creates a Gate from existing forest and engine state.
+// New creates a Gate from existing forest and engine state. The engine's
+// Sublinear flag is set from cfg.SublinearTF so vectorization respects the
+// user's choice — the engine itself doesn't persist that bit (it's a
+// runtime knob, not corpus state).
 func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
+	if e != nil {
+		e.Sublinear = cfg.SublinearTF
+	}
 	return &Gate{Forest: f, Engine: e, Config: cfg, vecCache: make(map[string]tfidf.Vector)}
 }
 
@@ -140,10 +159,7 @@ func New(f *forest.Forest, e *tfidf.Engine, cfg Config) *Gate {
 // audit. Skips are included because they represent real hook firings the user
 // may want to understand ("why didn't that terse prompt get recorded?").
 func (g *Gate) recordClassification(cls Classification, prompt string) {
-	snippet := prompt
-	if len(snippet) > 80 {
-		snippet = snippet[:80] + "..."
-	}
+	snippet := text.TruncateRunesWithSuffix(prompt, 83, "...")
 	treeID := ""
 	if cls.TreeIdx >= 0 && cls.TreeIdx < len(g.Forest.Trees) {
 		// For ActionNew the tree isn't in the forest yet; leave TreeID empty
@@ -224,7 +240,7 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 	// routed to ActionContinue/ActionSkip before calling the pure classifier,
 	// so classify() only ever sees inputs that warrant real scoring.
 	var cls Classification
-	if isTerse(tokens, vec) {
+	if isTerse(tokens, vec, g.Config.TerseTokenThreshold) {
 		if len(g.Forest.Trees) == 0 {
 			cls = Classification{Action: ActionSkip}
 		} else {
@@ -276,11 +292,16 @@ func (g *Gate) ProcessPrompt(prompt string, source string) string {
 		g.updatePeaks()
 		// Give the at-risk observer a chance to persist anything worth
 		// preserving (long-term memory candidates) before we mutate.
-		// Fires once per tree regardless of which leaves actually get
-		// removed — SelectCandidate filters by score so trees that don't
-		// qualify produce nothing.
+		// Skip single-node trees (root only, no children) — they can't
+		// pass SelectCandidate's minLeaves floor anyway, so firing the
+		// callback for them is pure throughput waste. With 50 trees in
+		// a forest at memory pressure, this filter typically halves
+		// per-prompt callback fan-out.
 		if g.OnTreeAtRisk != nil {
 			for _, t := range g.Forest.Trees {
+				if t.NodeCount() <= 1 {
+					continue
+				}
 				g.OnTreeAtRisk(t, "prune")
 			}
 		}
@@ -443,7 +464,11 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 		} else {
 			parentID := leaf.ParentID
 			if parentID == "" {
-				// Leaf is root — preserve and add as sibling
+				// Leaf IS the root — preserveRoot copies the original
+				// content into a new child of the root, then we add the
+				// new prompt as another child of the same root, so the
+				// two end up as siblings under root (not a parent-child
+				// chain).
 				g.preserveRoot(tree)
 				parentID = tree.RootID
 			}
@@ -457,24 +482,25 @@ func (g *Gate) apply(cls Classification, content string, source string, tokens [
 	}
 }
 
-// terseTokenThreshold is the maximum post-tokenization length for which a
-// prompt with no IDF signal is treated as a continuation rather than a new
-// tree. Prompts like "fix", "yes", "run it" tokenize to 1-2 tokens; longer
-// prompts with nil vec (e.g. a fresh 5-word topic whose vocabulary the corpus
-// has not seen yet) are genuine new topics and should fall through to the
-// normal classifier.
-const terseTokenThreshold = 2
+// defaultTerseTokenThreshold is the fallback when Config.TerseTokenThreshold
+// is zero. Two tokens routes "fix it", "yes please", "run it" to
+// ActionContinue while letting genuinely-new 5-word topics (vocabulary-
+// novel) fall through as ActionNew. Configurable per Config.TerseTokenThreshold.
+const defaultTerseTokenThreshold = 2
 
 // isTerse returns true when the prompt lacks enough signal to warrant a new
 // tree: either empty tokens (pure stop-words / blank text) or a very short
 // prompt that produces no IDF vector. Longer prompts with nil vec signal a
 // genuinely new topic — they are classified normally and land as ActionNew
 // via the standard path.
-func isTerse(tokens []string, vec tfidf.Vector) bool {
+func isTerse(tokens []string, vec tfidf.Vector, threshold int) bool {
 	if len(tokens) == 0 {
 		return true
 	}
-	return vec == nil && len(tokens) <= terseTokenThreshold
+	if threshold <= 0 {
+		threshold = defaultTerseTokenThreshold
+	}
+	return vec == nil && len(tokens) <= threshold
 }
 
 // lastActiveTreeIndex returns the index of the tree with the most recent
@@ -619,7 +645,13 @@ func (g *Gate) GenerateContext() string {
 		score float64
 	}
 	scored := make([]scoredTree, len(g.Forest.Trees))
-	now := g.Forest.Trees[0].LastAccessed
+	// Anchor scoring to wall-clock so peaks observed here line up with
+	// updatePeaks (which also uses time.Now()). Earlier code anchored
+	// to Trees[0].LastAccessed, but that's an arbitrary tree's time —
+	// when Trees[0] is the oldest, every other tree's score gets read
+	// against a stale "now" and `ObservePeak` records a value the next
+	// updatePeaks pass would never reproduce.
+	now := time.Now().UnixMilli()
 	for i, t := range g.Forest.Trees {
 		s := t.Root().Score(now, g.Config.DecayRate)
 		scored[i] = scoredTree{t, s}
@@ -729,11 +761,7 @@ func (g *Gate) renderTree(st struct {
 		if leaf.ID == st.tree.RootID {
 			continue
 		}
-		content := leaf.Content
-		if len(content) > 80 {
-			content = content[:80] + "..."
-		}
-		fmt.Fprintf(&b, "    - %s\n", content)
+		fmt.Fprintf(&b, "    - %s\n", text.TruncateRunesWithSuffix(leaf.Content, 83, "..."))
 	}
 
 	return b.String()
@@ -815,16 +843,41 @@ func (g *Gate) applySessionBoundary() {
 	}
 }
 
-// tryMerge checks all tree pairs for root cosine similarity above MergeSimilarity
-// and merges the smaller tree into the larger. All non-root nodes from the small
-// tree are re-parented as direct children of the large tree's root (flattened).
-// The small root itself is skipped — it is a bubbleUp abstraction, not a real
-// prompt, and the large tree will regenerate its own abstraction after bubbleUp.
-// Only one merge per ProcessPrompt call to avoid cascading merges that could
-// destabilize the forest.
+// maxMergesPerPrompt caps how many cluster merges can fire in a single
+// ProcessPrompt call. Earlier versions did exactly one — but on a
+// forest where three trees have drifted toward the same topic, that
+// dragged cluster collapse out over three prompts and left the
+// intermediate state visibly fragmented. Three is the smallest cap
+// that converges the realistic "two near-duplicates and an outlier"
+// case in one prompt while still bounding pathological cascades.
+const maxMergesPerPrompt = 3
+
+// tryMerge searches for tree pairs whose root cosine similarity meets
+// MergeSimilarity and merges the smaller tree into the larger. It
+// loops up to maxMergesPerPrompt times so a single prompt can collapse
+// a small cluster of near-duplicate trees rather than waiting N prompts
+// for N merges. Each iteration recomputes the best pair against the
+// current forest state — vectors of trees that just absorbed nodes are
+// invalidated by bubbleUp, so the next pass sees fresh similarities.
 func (g *Gate) tryMerge() {
-	if g.Config.MergeSimilarity <= 0 || len(g.Forest.Trees) < 2 {
+	if g.Config.MergeSimilarity <= 0 {
 		return
+	}
+	for i := 0; i < maxMergesPerPrompt; i++ {
+		if !g.tryMergeOnce() {
+			return
+		}
+	}
+}
+
+// tryMergeOnce performs a single best-pair merge and returns whether
+// anything was actually absorbed. Returns false when there are fewer
+// than two trees, when no pair clears MergeSimilarity, or when the
+// roots have no usable vectors. Factored out so the loop in tryMerge
+// can iterate cleanly without nested return-handling.
+func (g *Gate) tryMergeOnce() bool {
+	if len(g.Forest.Trees) < 2 {
+		return false
 	}
 
 	bestSim := 0.0
@@ -853,7 +906,7 @@ func (g *Gate) tryMerge() {
 	}
 
 	if bestSim < g.Config.MergeSimilarity || bestI < 0 {
-		return
+		return false
 	}
 
 	// Merge smaller into larger
@@ -895,6 +948,7 @@ func (g *Gate) tryMerge() {
 
 	// Remove the small tree from the forest
 	g.Forest.Trees = append(g.Forest.Trees[:bestJ], g.Forest.Trees[bestJ+1:]...)
+	return true
 }
 
 // ReinforceFromGuide processes unreinforced guide entries against the forest.

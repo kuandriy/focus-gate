@@ -60,7 +60,6 @@ func handleInspect(p paths, cfg config, asJSON bool) error {
 func handleDryRun(p paths, cfg config, prompt string, asJSON bool) error {
 	f := loadForest(p.intentFile)
 	e := loadEngine(p.engineFile)
-	_ = loadGuide(p.guideFile, cfg.GuideSize)
 
 	// Clean the prompt the same way the hook path does.
 	prompt = text.CleanPrompt(prompt)
@@ -88,6 +87,10 @@ func inspectText(w io.Writer, f *forest.Forest, e *tfidf.Engine, g *guide.Guide,
 	fmt.Fprintln(w)
 
 	// --- Config ---
+	// Print every knob, not the curated 7 — `--inspect` is the
+	// debugging surface, so a user tuning thresholds needs to see
+	// what's actually in effect (typoTolerance, memory weights,
+	// session boundary, merge similarity).
 	fmt.Fprintln(w, "--- Config ---")
 	fmt.Fprintf(w, "  memorySize:        %d\n", cfg.MemorySize)
 	fmt.Fprintf(w, "  decayRate:         %.3f\n", cfg.DecayRate)
@@ -95,7 +98,37 @@ func inspectText(w io.Writer, f *forest.Forest, e *tfidf.Engine, g *guide.Guide,
 	fmt.Fprintf(w, "  similarity.branch: %.3f\n", cfg.Similarity.Branch)
 	fmt.Fprintf(w, "  contextLimit:      %d\n", cfg.ContextLimit)
 	fmt.Fprintf(w, "  bubbleUpTerms:     %d\n", cfg.BubbleUpTerms)
+	fmt.Fprintf(w, "  maxRefsPerNode:    %d\n", cfg.MaxRefsPerNode)
 	fmt.Fprintf(w, "  guideSize:         %d\n", cfg.GuideSize)
+	fmt.Fprintf(w, "  sessionTimeout:    %.2fh\n", cfg.SessionTimeout)
+	fmt.Fprintf(w, "  mergeSimilarity:   %.3f\n", cfg.MergeSimilarity)
+	fmt.Fprintf(w, "  terseTokenThreshold: %d\n", cfg.TerseTokenThreshold)
+	fmt.Fprintf(w, "  sublinearTF:       %v\n", cfg.SublinearTF)
+	fmt.Fprintf(w, "  typoTolerance.enabled:           %v\n", cfg.TypoTolerance.Enabled)
+	fmt.Fprintf(w, "  typoTolerance.maxDistance:       %d\n", cfg.TypoTolerance.MaxDistance)
+	fmt.Fprintf(w, "  typoTolerance.minWordLen:        %d\n", cfg.TypoTolerance.MinWordLen)
+	fmt.Fprintf(w, "  typoTolerance.minEstablishedDF:  %d\n", cfg.TypoTolerance.MinEstablishedDF)
+	fmt.Fprintf(w, "  memory.enabled:                  %v\n", cfg.Memory.Enabled)
+	fmt.Fprintf(w, "  memory.dir:                      %s\n", cfg.Memory.Dir)
+	fmt.Fprintf(w, "  memory.surfaceThreshold:         %.3f\n", cfg.Memory.SurfaceThreshold)
+	fmt.Fprintf(w, "  memory.topK:                     %d\n", cfg.Memory.TopK)
+	fmt.Fprintf(w, "  memory.maxBlockChars:            %d\n", cfg.Memory.MaxBlockChars)
+	fmt.Fprintf(w, "  memory.minLeaves:                %d\n", cfg.Memory.MinLeaves)
+	fmt.Fprintf(w, "  memory.minPrompts:               %d\n", cfg.Memory.MinPrompts)
+	fmt.Fprintf(w, "  memory.promotionThreshold:       %.3f\n", cfg.Memory.PromotionThreshold)
+	fmt.Fprintf(w, "  memory.rescueThreshold:          %.3f\n", cfg.Memory.RescueThreshold)
+	fmt.Fprintf(w, "  memory.promotionCooldown:        %s\n", cfg.Memory.PromotionCooldown)
+	fmt.Fprintf(w, "  memory.pendingMaxAge:            %s\n", cfg.Memory.PendingMaxAge)
+	fmt.Fprintf(w, "  memory.mergeSuggestCosine:       %.3f\n", cfg.Memory.MergeSuggestCosine)
+	fmt.Fprintf(w, "  memory.dedupCosine:              %.3f\n", cfg.Memory.DedupCosine)
+	fmt.Fprintf(w, "  memory.autoNudge:                %v\n", cfg.Memory.AutoNudge)
+	fmt.Fprintf(w, "  memory.commitRetries:            %d\n", cfg.Memory.CommitRetries)
+	fmt.Fprintf(w, "  memory.weights.asset:            %.2f\n", cfg.Memory.Weights.Asset)
+	fmt.Fprintf(w, "  memory.weights.topic:            %.2f\n", cfg.Memory.Weights.Topic)
+	fmt.Fprintf(w, "  memory.weights.interest:         %.2f\n", cfg.Memory.Weights.Interest)
+	fmt.Fprintf(w, "  memory.weights.fingerprint:      %.2f\n", cfg.Memory.Weights.Fingerprint)
+	fmt.Fprintf(w, "  memory.frequencyBonus:           %.3f\n", cfg.Memory.FrequencyBonus)
+	fmt.Fprintf(w, "  memory.redactPatterns:           %d configured\n", len(cfg.Memory.RedactPatterns))
 	fmt.Fprintln(w)
 
 	// --- Forest ---
@@ -138,7 +171,7 @@ func inspectText(w io.Writer, f *forest.Forest, e *tfidf.Engine, g *guide.Guide,
 		}
 		summary := entry.Summary
 		if len(summary) > 80 {
-			summary = summary[:80] + "..."
+			summary = truncate(summary, 83)
 		}
 		treeName := resolveNodeTree(f, entry.IntentID)
 		if treeName != "" {
@@ -181,7 +214,7 @@ func dryRunText(result gate.DryRunResult, cfg config) error {
 		for _, ts := range result.TreeScores {
 			rootContent := ts.RootContent
 			if len(rootContent) > 50 {
-				rootContent = rootContent[:50] + "..."
+				rootContent = truncate(rootContent, 53)
 			}
 			fmt.Fprintf(w, "  Tree #%d %q\n", ts.TreeIdx, rootContent)
 			fmt.Fprintf(w, "    Root %-14s  cosine=%.4f\n",
@@ -190,7 +223,7 @@ func dryRunText(result gate.DryRunResult, cfg config) error {
 			for _, ls := range ts.LeafScores {
 				leafContent := ls.Content
 				if len(leafContent) > 50 {
-					leafContent = leafContent[:50] + "..."
+					leafContent = truncate(leafContent, 53)
 				}
 				marker := ""
 				if ls.LeafID == result.BestLeaf && result.BestTree == ts.TreeIdx {
@@ -403,7 +436,7 @@ func writeNodeTree(w io.Writer, tree *forest.Tree, nodeID string, prefix string,
 	}
 	content := node.Content
 	if len(content) > 70 {
-		content = content[:70] + "..."
+		content = truncate(content, 73)
 	}
 
 	if isRoot {
@@ -433,7 +466,7 @@ func writeNodeTree(w io.Writer, tree *forest.Tree, nodeID string, prefix string,
 		}
 		cContent := child.Content
 		if len(cContent) > 70 {
-			cContent = cContent[:70] + "..."
+			cContent = truncate(cContent, 73)
 		}
 
 		fmt.Fprintf(w, "%s%s%s  d=%d w=%.2f f=%d idx=%s s=%.3f\n",
@@ -512,7 +545,7 @@ func treeNameByID(f *forest.Forest, treeID string) string {
 			if root != nil {
 				name := root.Content
 				if len(name) > 40 {
-					name = name[:40] + "..."
+					name = truncate(name, 43)
 				}
 				return name
 			}
@@ -533,7 +566,7 @@ func resolveNodeTree(f *forest.Forest, nodeID string) string {
 			if root != nil {
 				name := root.Content
 				if len(name) > 30 {
-					name = name[:30] + "..."
+					name = truncate(name, 33)
 				}
 				return name
 			}

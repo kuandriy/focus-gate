@@ -1,0 +1,590 @@
+{
+  "schemaVersion": "2",
+  "source": "focus-gate",
+  "vocabHash": "4c2a0a2a07a5c6b3",
+  "rebuiltAt": "2026-05-07T14:34:57Z",
+  "entries": [
+    {
+      "id": "mem_20260507_a1b2c3",
+      "source": "focus-gate",
+      "title": "Four-stage organic refinement: the philosophical bet",
+      "path": "mem_20260507_a1b2c3.md",
+      "version": 1,
+      "chapters": 1,
+      "timeMarkers": [
+        "2026-04-22..2026-05-07"
+      ],
+      "interests": [
+        {
+          "Name": "organic refinement",
+          "Weight": 1
+        },
+        {
+          "Name": "knowledge vs skills",
+          "Weight": 1
+        },
+        {
+          "Name": "user attention as signal",
+          "Weight": 1
+        }
+      ],
+      "topics": [
+        {
+          "Name": "four stages of refinement",
+          "Weight": 1
+        },
+        {
+          "Name": "why prescriptive skills fail",
+          "Weight": 1
+        },
+        {
+          "Name": "frequency as cornerstone signal",
+          "Weight": 1
+        }
+      ],
+      "assets": [
+        "README.md",
+        "docs/memory-focus.md"
+      ],
+      "topTerms": [
+        "memory",
+        "review",
+        "append-on",
+        "chapter",
+        "gate",
+        "index",
+        "llm-mediat"
+      ],
+      "fingerprint": {
+        "append-on": 0.014441131288945006,
+        "chapter": 0.014441131288945006,
+        "gate": 0.014441131288945006,
+        "index": 0.014441131288945006,
+        "llm-mediat": 0.014441131288945006,
+        "memory": 0.043323393866835015,
+        "review": 0.028882262577890012
+      },
+      "created": "2026-05-07T00:00:00Z",
+      "updated": "2026-05-07T00:00:00Z",
+      "touchedBy": 0
+    },
+    {
+      "id": "mem_20260507_b4c5d6",
+      "source": "focus-gate",
+      "title": "Sliding-window intent forest mechanics",
+      "path": "mem_20260507_b4c5d6.md",
+      "version": 1,
+      "chapters": 1,
+      "timeMarkers": [
+        "2026-04-22..2026-05-07"
+      ],
+      "interests": [
+        {
+          "Name": "TF-IDF classification",
+          "Weight": 1
+        },
+        {
+          "Name": "decay scoring",
+          "Weight": 1
+        },
+        {
+          "Name": "pruning with peak-score rescue",
+          "Weight": 1
+        },
+        {
+          "Name": "bubble-up abstraction",
+          "Weight": 1
+        },
+        {
+          "Name": "cluster merging",
+          "Weight": 1
+        },
+        {
+          "Name": "typo tolerance",
+          "Weight": 1
+        }
+      ],
+      "topics": [
+        {
+          "Name": "intent classification actions",
+          "Weight": 1
+        },
+        {
+          "Name": "TF-IDF cosine similarity",
+          "Weight": 1
+        },
+        {
+          "Name": "session boundary frequency halving",
+          "Weight": 1
+        },
+        {
+          "Name": "min-heap-based pruning",
+          "Weight": 1
+        }
+      ],
+      "assets": [
+        "internal/forest/forest.go",
+        "internal/forest/tree.go",
+        "internal/forest/node.go",
+        "internal/gate/gate.go",
+        "internal/tfidf/engine.go",
+        "internal/text/canonicalize.go",
+        "docs/sliding-window-intent-forest.md"
+      ],
+      "topTerms": [
+        "internal",
+        "tf-idf",
+        "classifica",
+        "abstrac",
+        "bubble-up",
+        "gate",
+        "scor",
+        "decay"
+      ],
+      "fingerprint": {
+        "abstrac": 0.03759945455594409,
+        "bubble-up": 0.03759945455594409,
+        "chapter": 0.009399863638986022,
+        "classifica": 0.046999318194930105,
+        "decay": 0.02819959091695807,
+        "gate": 0.03759945455594409,
+        "internal": 0.07886639659887727,
+        "scor": 0.03759945455594409,
+        "tf-idf": 0.05639918183391614,
+        "work": 0.006572199716573106
+      },
+      "created": "2026-05-07T00:00:00Z",
+      "updated": "2026-05-07T00:00:00Z",
+      "touchedBy": 1
+    },
+    {
+      "id": "mem_20260507_c7d8e9",
+      "source": "focus-gate",
+      "title": "Memory v2 format: append-only chapters with aggregate index",
+      "path": "mem_20260507_c7d8e9.md",
+      "version": 1,
+      "chapters": 1,
+      "timeMarkers": [
+        "2026-04-30..2026-05-07"
+      ],
+      "interests": [
+        {
+          "Name": "append-only invariants",
+          "Weight": 1
+        },
+        {
+          "Name": "weighted aggregate index",
+          "Weight": 1
+        },
+        {
+          "Name": "chapter-level metadata",
+          "Weight": 1
+        },
+        {
+          "Name": "v1 to v2 migration",
+          "Weight": 1
+        }
+      ],
+      "topics": [
+        {
+          "Name": "memory frontmatter format",
+          "Weight": 1
+        },
+        {
+          "Name": "chapter What/Why structure",
+          "Weight": 1
+        },
+        {
+          "Name": "weight derivation from chapter coverage",
+          "Weight": 1
+        },
+        {
+          "Name": "migration with v1.bak backup",
+          "Weight": 1
+        }
+      ],
+      "assets": [
+        "internal/memory/memory.go",
+        "internal/memory/chapter.go",
+        "internal/memory/frontmatter.go",
+        "internal/memory/migrate.go",
+        "docs/memory-focus.md",
+        "docs/SHARED_MEMORY_PLAN.md"
+      ],
+      "topTerms": [
+        "chapter",
+        "memory",
+        "weight",
+        "internal",
+        "index",
+        "aggregate",
+        "append-on",
+        "actu"
+      ],
+      "fingerprint": {
+        "actu": 0.010097509768442016,
+        "aggregate": 0.040390039073768064,
+        "append-on": 0.040390039073768064,
+        "chapter": 0.17165766606351426,
+        "index": 0.05048754884221008,
+        "internal": 0.05647984131430013,
+        "memory": 0.15146264652663025,
+        "review": 0.010097509768442016,
+        "surface": 0.010097509768442016,
+        "weight": 0.08078007814753613
+      },
+      "created": "2026-05-07T00:00:00Z",
+      "updated": "2026-05-07T00:00:00Z",
+      "touchedBy": 0
+    },
+    {
+      "id": "mem_20260507_d0e1f2",
+      "source": "focus-gate",
+      "title": "Multi-tier surface scoring: asset, topic, interest, fingerprint",
+      "path": "mem_20260507_d0e1f2.md",
+      "version": 1,
+      "chapters": 1,
+      "timeMarkers": [
+        "2026-05-04..2026-05-07"
+      ],
+      "interests": [
+        {
+          "Name": "tier-weighted scoring",
+          "Weight": 1
+        },
+        {
+          "Name": "inverted indexes",
+          "Weight": 1
+        },
+        {
+          "Name": "multi-source composition",
+          "Weight": 1
+        },
+        {
+          "Name": "asset extraction",
+          "Weight": 1
+        }
+      ],
+      "topics": [
+        {
+          "Name": "per-prompt memory surfacing",
+          "Weight": 1
+        },
+        {
+          "Name": "max-combine across tiers",
+          "Weight": 1
+        },
+        {
+          "Name": "ByAsset ByInterest ByTopic",
+          "Weight": 1
+        },
+        {
+          "Name": "prompt asset extraction",
+          "Weight": 1
+        }
+      ],
+      "assets": [
+        "internal/memory/surface.go",
+        "internal/memory/manifest.go",
+        "internal/memory/multi_source.go",
+        "internal/text/refs.go"
+      ],
+      "topTerms": [
+        "memory",
+        "surface",
+        "internal",
+        "scor",
+        "weight",
+        "index",
+        "actu",
+        "chapter"
+      ],
+      "fingerprint": {
+        "actu": 0.009468727108868704,
+        "chapter": 0.009468727108868704,
+        "index": 0.028406181326606113,
+        "internal": 0.052962781598757634,
+        "memory": 0.12309345241529314,
+        "scor": 0.037874908435474815,
+        "surface": 0.056812362653212226,
+        "weight": 0.037874908435474815
+      },
+      "created": "2026-05-07T00:00:00Z",
+      "updated": "2026-05-07T00:00:00Z",
+      "touchedBy": 1
+    },
+    {
+      "id": "mem_20260507_e3f4a5",
+      "source": "focus-gate",
+      "title": "Stage B candidate review: append vs create vs discard",
+      "path": "mem_20260507_e3f4a5.md",
+      "version": 1,
+      "chapters": 1,
+      "timeMarkers": [
+        "2026-05-04..2026-05-07"
+      ],
+      "interests": [
+        {
+          "Name": "LLM-mediated review",
+          "Weight": 1
+        },
+        {
+          "Name": "structured commit JSON",
+          "Weight": 1
+        },
+        {
+          "Name": "retry budget",
+          "Weight": 1
+        },
+        {
+          "Name": "aggregate index without bodies",
+          "Weight": 1
+        }
+      ],
+      "topics": [
+        {
+          "Name": "candidate to memory promotion",
+          "Weight": 1
+        },
+        {
+          "Name": "append create discard decision",
+          "Weight": 1
+        },
+        {
+          "Name": "structured validation errors",
+          "Weight": 1
+        },
+        {
+          "Name": "retry loop with budget",
+          "Weight": 1
+        }
+      ],
+      "assets": [
+        "internal/memory/commit.go",
+        "internal/memory/promote.go",
+        "internal/memory/candidate.go",
+        "internal/memory/pending.go"
+      ],
+      "topTerms": [
+        "memory",
+        "internal",
+        "index",
+        "retry",
+        "aggregate",
+        "budget",
+        "review",
+        "llm-mediat"
+      ],
+      "fingerprint": {
+        "abstrac": 0.009365806162033174,
+        "aggregate": 0.0374632246481327,
+        "budget": 0.0374632246481327,
+        "chapter": 0.009365806162033174,
+        "index": 0.04682903081016587,
+        "internal": 0.05238709919007548,
+        "llm-mediat": 0.01873161232406635,
+        "memory": 0.1498528985925308,
+        "retry": 0.04682903081016587,
+        "review": 0.02809741848609952,
+        "surface": 0.009365806162033174,
+        "weight": 0.009365806162033174
+      },
+      "created": "2026-05-07T00:00:00Z",
+      "updated": "2026-05-07T00:00:00Z",
+      "touchedBy": 0
+    }
+  ],
+  "byAsset": {
+    "docs/memory-focus.md": [
+      "mem_20260507_a1b2c3",
+      "mem_20260507_c7d8e9"
+    ],
+    "docs/shared_memory_plan.md": [
+      "mem_20260507_c7d8e9"
+    ],
+    "docs/sliding-window-intent-forest.md": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/forest/forest.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/forest/node.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/forest/tree.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/gate/gate.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/memory/candidate.go": [
+      "mem_20260507_e3f4a5"
+    ],
+    "internal/memory/chapter.go": [
+      "mem_20260507_c7d8e9"
+    ],
+    "internal/memory/commit.go": [
+      "mem_20260507_e3f4a5"
+    ],
+    "internal/memory/frontmatter.go": [
+      "mem_20260507_c7d8e9"
+    ],
+    "internal/memory/manifest.go": [
+      "mem_20260507_d0e1f2"
+    ],
+    "internal/memory/memory.go": [
+      "mem_20260507_c7d8e9"
+    ],
+    "internal/memory/migrate.go": [
+      "mem_20260507_c7d8e9"
+    ],
+    "internal/memory/multi_source.go": [
+      "mem_20260507_d0e1f2"
+    ],
+    "internal/memory/pending.go": [
+      "mem_20260507_e3f4a5"
+    ],
+    "internal/memory/promote.go": [
+      "mem_20260507_e3f4a5"
+    ],
+    "internal/memory/surface.go": [
+      "mem_20260507_d0e1f2"
+    ],
+    "internal/text/canonicalize.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "internal/text/refs.go": [
+      "mem_20260507_d0e1f2"
+    ],
+    "internal/tfidf/engine.go": [
+      "mem_20260507_b4c5d6"
+    ],
+    "readme.md": [
+      "mem_20260507_a1b2c3"
+    ]
+  },
+  "byInterest": {
+    "aggregate index without bodies": [
+      "mem_20260507_e3f4a5"
+    ],
+    "append-only invariants": [
+      "mem_20260507_c7d8e9"
+    ],
+    "asset extraction": [
+      "mem_20260507_d0e1f2"
+    ],
+    "bubble-up abstraction": [
+      "mem_20260507_b4c5d6"
+    ],
+    "chapter-level metadata": [
+      "mem_20260507_c7d8e9"
+    ],
+    "cluster merging": [
+      "mem_20260507_b4c5d6"
+    ],
+    "decay scoring": [
+      "mem_20260507_b4c5d6"
+    ],
+    "inverted indexes": [
+      "mem_20260507_d0e1f2"
+    ],
+    "knowledge vs skills": [
+      "mem_20260507_a1b2c3"
+    ],
+    "llm-mediated review": [
+      "mem_20260507_e3f4a5"
+    ],
+    "multi-source composition": [
+      "mem_20260507_d0e1f2"
+    ],
+    "organic refinement": [
+      "mem_20260507_a1b2c3"
+    ],
+    "pruning with peak-score rescue": [
+      "mem_20260507_b4c5d6"
+    ],
+    "retry budget": [
+      "mem_20260507_e3f4a5"
+    ],
+    "structured commit json": [
+      "mem_20260507_e3f4a5"
+    ],
+    "tf-idf classification": [
+      "mem_20260507_b4c5d6"
+    ],
+    "tier-weighted scoring": [
+      "mem_20260507_d0e1f2"
+    ],
+    "typo tolerance": [
+      "mem_20260507_b4c5d6"
+    ],
+    "user attention as signal": [
+      "mem_20260507_a1b2c3"
+    ],
+    "v1 to v2 migration": [
+      "mem_20260507_c7d8e9"
+    ],
+    "weighted aggregate index": [
+      "mem_20260507_c7d8e9"
+    ]
+  },
+  "byTopic": {
+    "append create discard decision": [
+      "mem_20260507_e3f4a5"
+    ],
+    "byasset byinterest bytopic": [
+      "mem_20260507_d0e1f2"
+    ],
+    "candidate to memory promotion": [
+      "mem_20260507_e3f4a5"
+    ],
+    "chapter what/why structure": [
+      "mem_20260507_c7d8e9"
+    ],
+    "four stages of refinement": [
+      "mem_20260507_a1b2c3"
+    ],
+    "frequency as cornerstone signal": [
+      "mem_20260507_a1b2c3"
+    ],
+    "intent classification actions": [
+      "mem_20260507_b4c5d6"
+    ],
+    "max-combine across tiers": [
+      "mem_20260507_d0e1f2"
+    ],
+    "memory frontmatter format": [
+      "mem_20260507_c7d8e9"
+    ],
+    "migration with v1.bak backup": [
+      "mem_20260507_c7d8e9"
+    ],
+    "min-heap-based pruning": [
+      "mem_20260507_b4c5d6"
+    ],
+    "per-prompt memory surfacing": [
+      "mem_20260507_d0e1f2"
+    ],
+    "prompt asset extraction": [
+      "mem_20260507_d0e1f2"
+    ],
+    "retry loop with budget": [
+      "mem_20260507_e3f4a5"
+    ],
+    "session boundary frequency halving": [
+      "mem_20260507_b4c5d6"
+    ],
+    "structured validation errors": [
+      "mem_20260507_e3f4a5"
+    ],
+    "tf-idf cosine similarity": [
+      "mem_20260507_b4c5d6"
+    ],
+    "weight derivation from chapter coverage": [
+      "mem_20260507_c7d8e9"
+    ],
+    "why prescriptive skills fail": [
+      "mem_20260507_a1b2c3"
+    ]
+  }
+}

@@ -89,6 +89,57 @@ func ExtractFilePaths(text string, maxRefs int) []string {
 	return refs
 }
 
+// endpointPattern matches HTTP endpoint references like "POST /auth/refresh"
+// or "GET /api/v1/users". The verb is anchored at a word boundary; the
+// path segment continues until whitespace, a closing punctuation char, or
+// EOL. Used by ExtractAssets so memory's surface tier-1 (asset) lookup
+// can match prompts that mention an endpoint by name.
+var endpointPattern = regexp.MustCompile(`\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(/[^\s\)\}\],;:'"<>]+)`)
+
+// ExtractEndpoints returns API endpoint references like "POST /auth/refresh".
+// Used as a memory asset extractor alongside ExtractFilePaths so prompts
+// that say "let's wire POST /auth/refresh" surface auth-domain memories
+// without needing the prompt to mention the file path.
+func ExtractEndpoints(text string) []string {
+	if text == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range endpointPattern.FindAllStringSubmatch(text, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		verb := strings.ToUpper(m[1])
+		path := m[2]
+		// Trim a trailing slash for normalization, except when path is
+		// just "/". POST /auth and POST /auth/ should look the same.
+		if len(path) > 1 && strings.HasSuffix(path, "/") {
+			path = strings.TrimRight(path, "/")
+		}
+		key := verb + " " + path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out
+}
+
+// ExtractAssets is the union of file-path and endpoint extraction —
+// the canonical "extract candidate assets from the prompt" entry point
+// for the memory surface tier-1 lookup.
+//
+// Phased per SHARED_MEMORY_PLAN §13.1: file paths first, endpoints
+// second; env vars and function-name patterns deferred until Open
+// Question §12.1 is resolved.
+func ExtractAssets(text string, maxFilePaths int) []string {
+	out := ExtractFilePaths(text, maxFilePaths)
+	out = append(out, ExtractEndpoints(text)...)
+	return out
+}
+
 // FilterExistingPaths returns only those paths that exist on disk relative to
 // baseDir. An empty baseDir disables validation and the input is returned
 // unchanged — callers that can't supply a working directory (tests, CI dry

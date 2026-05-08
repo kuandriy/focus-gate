@@ -7,65 +7,6 @@ import (
 	"github.com/kuandriy/focus-gate/internal/forest"
 )
 
-func TestParseSlashCommand(t *testing.T) {
-	tests := []struct {
-		name    string
-		raw     string
-		wantOk  bool
-		wantSub string
-		wantArg string
-	}{
-		{"empty", "", false, "", ""},
-		{"normal prompt", "add JWT authentication", false, "", ""},
-
-		// The hook parser intentionally does NOT recognise "/focus …" —
-		// that form is handled by Claude Code's custom-command layer
-		// (.claude/commands/focus.md running the binary in --cmd mode)
-		// and never reaches UserPromptSubmit. Asserting these parse as
-		// false guards against anyone re-adding the prefix later.
-		{"/focus alone not hook-level", "/focus", false, "", ""},
-		{"/focus status not hook-level", "/focus status", false, "", ""},
-		{"/focus tree not hook-level", "/focus tree 0", false, "", ""},
-
-		// fg: is the sole hook-level trigger.
-		{"just fg:", "fg:", true, "help", ""},
-		{"fg: status", "fg: status", true, "status", ""},
-		{"fg:status no space", "fg:status", true, "status", ""},
-		{"fg: health", "fg: health", true, "health", ""},
-		{"FG: case", "FG: status", true, "status", ""},
-		{"fg: tree with index", "fg: tree 2", true, "tree", "2"},
-		{"fg: tree with id", "fg: tree abc123", true, "tree", "abc123"},
-		{"fg: terms", "fg: terms", true, "terms", ""},
-		{"fg: terms with count", "fg: terms 50", true, "terms", "50"},
-		{"fg: last", "fg: last", true, "last", ""},
-		{"fg memory health", "fg: memory health", true, "memory", "health"},
-		{"fg memory show", "fg: memory show abc", true, "memory", "show abc"},
-		{"fg: score with prompt", "fg: score add auth to api", true, "score", "add auth to api"},
-		{"fg: unknown sub", "fg: foobar", true, "foobar", ""},
-
-		// fg: must not match prefixes of other words.
-		{"not fg: — fgate", "fgate status", false, "", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cmd, ok := parseSlashCommand(tt.raw)
-			if ok != tt.wantOk {
-				t.Fatalf("parseSlashCommand(%q): ok = %v, want %v", tt.raw, ok, tt.wantOk)
-			}
-			if !ok {
-				return
-			}
-			if cmd.sub != tt.wantSub {
-				t.Errorf("sub = %q, want %q", cmd.sub, tt.wantSub)
-			}
-			if cmd.arg != tt.wantArg {
-				t.Errorf("arg = %q, want %q", cmd.arg, tt.wantArg)
-			}
-		})
-	}
-}
-
 func TestFindTree(t *testing.T) {
 	f := setupTestForest()
 

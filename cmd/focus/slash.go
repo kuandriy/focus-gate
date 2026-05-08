@@ -22,51 +22,19 @@ type slashCommand struct {
 	arg string // e.g. tree index/ID, or prompt text for score
 }
 
-// commandPrefix is the hook-level trigger that routes a prompt through the
-// inspector instead of normal classification.
-//
-// "/focus <sub>" exists at a different layer — a registered Claude Code
-// custom slash command (.claude/commands/focus.md) that runs the binary
-// in --cmd mode. That path never reaches UserPromptSubmit, so the hook
-// parser does not need to recognise it. "fg:" is the bedrock: works in
-// any environment where the hook runs, with zero additional setup. Short
-// enough to type, distinctive enough to never collide with English prose.
-const commandPrefix = "fg:"
-
-// parseSlashCommand checks whether the raw (uncleaned) prompt begins with
-// the hook-level command prefix and, if so, extracts the subcommand and
-// optional argument. Returns (cmd, true) on match, zero value otherwise.
-//
-// Matching rules:
-//   - Leading whitespace is trimmed.
-//   - Case-insensitive ("FG:", "Fg:", "fg:" all match).
-//   - The ":" self-delimits, so "fg:status" and "fg: status" both work.
-func parseSlashCommand(raw string) (slashCommand, bool) {
-	trimmed := strings.TrimSpace(raw)
-	lower := strings.ToLower(trimmed)
-
-	if !strings.HasPrefix(lower, commandPrefix) {
-		return slashCommand{}, false
-	}
-
-	rest := strings.TrimSpace(trimmed[len(commandPrefix):])
-	if rest == "" {
-		return slashCommand{sub: "help"}, true
-	}
-
-	parts := strings.SplitN(rest, " ", 2)
-	sub := strings.ToLower(parts[0])
-	arg := ""
-	if len(parts) > 1 {
-		arg = strings.TrimSpace(parts[1])
-	}
-	return slashCommand{sub: sub, arg: arg}, true
-}
-
 // handleSlashCommand dispatches a parsed slash command to the appropriate handler.
-// All commands load state read-only — no mutations, no saves.
+//
+// Slash commands enter the binary exclusively through the registered
+// Claude Code custom slash command (.claude/commands/focus.md) which runs
+// the binary in --cmd mode. The UserPromptSubmit hook itself does not
+// intercept any prompt prefix — every typed prompt goes through normal
+// classification.
+//
+// Most commands load state read-only, but the memory subcommands
+// (commit, discard, forget, reindex, migrate-v1, source attach/detach/
+// enable/disable/default) intentionally mutate disk — the slash surface
+// is the documented mutation channel for the memory layer.
 func handleSlashCommand(cmd slashCommand, p paths, cfg config, w io.Writer) error {
-	// Load all state (read-only)
 	f := loadForest(p.intentFile)
 	e := loadEngine(p.engineFile)
 	g := loadGuide(p.guideFile, cfg.GuideSize)
@@ -147,7 +115,7 @@ func slashTree(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg s
 			score := root.Score(now, cfg.DecayRate)
 			content := root.Content
 			if len(content) > 60 {
-				content = content[:60] + "..."
+				content = truncate(content, 63)
 			}
 			fmt.Fprintf(w, "  #%d [%s] score=%.3f  %d nodes  %q\n",
 				i, tree.ID[:8], score, tree.NodeCount(), content)
@@ -205,7 +173,7 @@ func slashTree(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg s
 			}
 			content := leaf.Content
 			if len(content) > 50 {
-				content = content[:50] + "..."
+				content = truncate(content, 53)
 			}
 			leafScore := leaf.Score(now, cfg.DecayRate)
 			fmt.Fprintf(w, "    %s (score=%.3f) %q\n", leaf.ID[:8], leafScore, content)
@@ -233,7 +201,7 @@ func slashTree(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg s
 			}
 			content := leaf.Content
 			if len(content) > 50 {
-				content = content[:50] + "..."
+				content = truncate(content, 53)
 			}
 			fmt.Fprintf(w, "    [PRUNE?] %s  score=%.3f  %q\n",
 				leaf.ID[:8], leaf.Score(now, cfg.DecayRate), content)
@@ -307,7 +275,7 @@ func slashScore(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg 
 	for _, ts := range result.TreeScores {
 		rootContent := ts.RootContent
 		if len(rootContent) > 50 {
-			rootContent = rootContent[:50] + "..."
+			rootContent = truncate(rootContent, 53)
 		}
 		fmt.Fprintf(w, "  Tree #%d %q\n", ts.TreeIdx, rootContent)
 		fmt.Fprintf(w, "    Root %-14s  cosine=%.4f\n",
@@ -316,7 +284,7 @@ func slashScore(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config, arg 
 		for _, ls := range ts.LeafScores {
 			leafContent := ls.Content
 			if len(leafContent) > 50 {
-				leafContent = leafContent[:50] + "..."
+				leafContent = truncate(leafContent, 53)
 			}
 			marker := ""
 			if ls.LeafID == result.BestLeaf && result.BestTree == ts.TreeIdx {
@@ -381,6 +349,26 @@ func slashHealth(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config) err
 		fmt.Fprintln(w, "  Trees:   0")
 	}
 	fmt.Fprintf(w, "  Prompts: %d\n", f.Meta.TotalPrompts)
+
+	// Session boundary state — let the user see when frequencies will
+	// next be halved (or that the gap has already exceeded the
+	// threshold and the next prompt will trigger). Mirrors the math in
+	// gate.applySessionBoundary so the output stays in sync.
+	if cfg.SessionTimeout > 0 && f.Meta.LastUpdate > 0 {
+		gapHours := float64(now-f.Meta.LastUpdate) / 3600000.0
+		switch {
+		case gapHours >= cfg.SessionTimeout:
+			fmt.Fprintf(w, "  Session: %s since last prompt — boundary will trigger on next prompt (timeout=%.1fh)\n",
+				formatAge(gapHours), cfg.SessionTimeout)
+		default:
+			remaining := cfg.SessionTimeout - gapHours
+			fmt.Fprintf(w, "  Session: %s since last prompt; next boundary in %s (timeout=%.1fh)\n",
+				formatAge(gapHours), formatAge(remaining), cfg.SessionTimeout)
+		}
+	} else if cfg.SessionTimeout <= 0 {
+		fmt.Fprintln(w, "  Session: boundary detection disabled (sessionTimeout=0)")
+	}
+
 	fmt.Fprintln(w)
 
 	// --- Term diversity ---
@@ -417,7 +405,7 @@ func slashHealth(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config) err
 			ageHours := float64(now-tree.LastAccessed) / 3600000.0
 			name := root.Content
 			if len(name) > 40 {
-				name = name[:40] + "..."
+				name = truncate(name, 43)
 			}
 
 			tag := "[HOT]"
@@ -462,7 +450,7 @@ func slashHealth(w io.Writer, f *forest.Forest, e *tfidf.Engine, cfg config) err
 				}
 				content := leaf.Content
 				if len(content) > 40 {
-					content = content[:40] + "..."
+					content = truncate(content, 43)
 				}
 				candidates = append(candidates, candidate{
 					treeIdx: i,
@@ -525,12 +513,10 @@ func slashLast(w io.Writer, f *forest.Forest) error {
 	return nil
 }
 
-// truncate returns s limited to n runes with an ellipsis suffix when truncated.
+// truncate returns s limited to n runes with an ellipsis suffix when
+// truncated. Rune-aware (no UTF-8 splits) and panic-safe for n < 3.
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-3] + "..."
+	return text.TruncateRunesWithSuffix(s, n, "...")
 }
 
 // ---------------------------------------------------------------------------
@@ -546,12 +532,8 @@ func slashHelp(w io.Writer) error {
 	fmt.Fprintln(w, "  /focus score \"prompt\"  Dry-run classification scoring")
 	fmt.Fprintln(w, "  /focus last            Recent classifications (action + score)")
 	fmt.Fprintln(w, "  /focus health          System diagnostics and pruning forecast")
-	fmt.Fprintln(w, "  /focus memory ...      Long-term memory: list | show <id> | pending | discard <id|all> | health")
+	fmt.Fprintln(w, "  /focus memory ...      Long-term memory: list | show <id> | diff <id> | pending | promote [tempId] | commit <tempId> '<json>' | discard <id|all> | forget <id> [--yes] | why \"prompt\" | health | reindex [--source <name>] | migrate-v1 | source ...")
 	fmt.Fprintln(w, "  /focus help            This help message")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Two ways to invoke:")
-	fmt.Fprintln(w, "  /focus <sub>    registered slash command (resolves via .claude/commands)")
-	fmt.Fprintln(w, "  fg: <sub>       hook-level intercept — works anywhere the hook runs")
 	return nil
 }
 

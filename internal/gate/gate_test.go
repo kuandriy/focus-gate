@@ -680,6 +680,97 @@ func TestClusterMerging(t *testing.T) {
 	}
 }
 
+// On a forest where three trees have all drifted toward the same
+// topic, a single ProcessPrompt should now collapse the cluster in
+// one pass instead of leaving two stranded merges for future prompts.
+// Bounded at maxMergesPerPrompt so a pathological corpus cannot melt
+// every tree into one on a single prompt.
+//
+// We don't assert exact convergence to one tree because bubble-up
+// regenerates the absorbed tree's root abstraction after each merge,
+// and a noisier corpus can drag the post-merge abstraction below the
+// threshold for the next pair. The contract is "more than one merge
+// can fire per prompt", not "the cluster always collapses fully."
+func TestClusterMerging_MultipleMergesInOnePrompt(t *testing.T) {
+	f := forest.NewForest()
+	e := tfidf.NewEngine()
+
+	cfg := DefaultConfig()
+	cfg.MergeSimilarity = 0.5
+
+	tree1 := forest.NewTree("JWT authentication token security", "p1")
+	tree2 := forest.NewTree("JWT authentication token validation", "p2")
+	tree3 := forest.NewTree("JWT authentication token rotation", "p3")
+	f.AddTree(tree1)
+	f.AddTree(tree2)
+	f.AddTree(tree3)
+	f.Meta.TotalPrompts = 3
+
+	e.AddDocument([]string{"jwt", "authentication", "token", "security"})
+	e.AddDocument([]string{"jwt", "authentication", "token", "validation"})
+	e.AddDocument([]string{"jwt", "authentication", "token", "rotation"})
+	startTrees := len(f.Trees)
+
+	mergeCount := 0
+	g := New(f, e, cfg)
+	g.OnTreeAtRisk = func(_ *forest.Tree, reason string) {
+		if reason == "merge" {
+			mergeCount++
+		}
+	}
+
+	// Off-topic prompt so the merge logic is the only thing reducing
+	// tree count below 4 (the new tree adds a 4th).
+	g.ProcessPrompt("fix the database migration error", "p4")
+
+	if mergeCount < 2 {
+		t.Errorf("expected ≥ 2 merges in one prompt, got %d (forest went from %d → %d trees)",
+			mergeCount, startTrees, len(g.Forest.Trees))
+	}
+	if mergeCount > maxMergesPerPrompt {
+		t.Errorf("merge count %d exceeded cap %d", mergeCount, maxMergesPerPrompt)
+	}
+}
+
+// Cap regression: even when every pair stays above the merge
+// threshold across all iterations, tryMerge stops at
+// maxMergesPerPrompt so a pathological corpus can't collapse every
+// tree into one on a single prompt.
+func TestClusterMerging_RespectsMaxMergesCap(t *testing.T) {
+	f := forest.NewForest()
+	e := tfidf.NewEngine()
+
+	cfg := DefaultConfig()
+	cfg.MergeSimilarity = 0.05 // very permissive — every pair will match
+
+	// 1 + maxMergesPerPrompt + 2 trees so the cap actively blocks the
+	// last possible merges. With 6 trees and cap=3, we expect ≥ 2
+	// trees remaining after one ProcessPrompt (4 - cap merges - new
+	// off-topic tree, plus margin).
+	for i := 0; i < maxMergesPerPrompt+3; i++ {
+		f.AddTree(forest.NewTree("auth jwt session", "p"))
+		e.AddDocument([]string{"auth", "jwt", "session"})
+	}
+	f.Meta.TotalPrompts = len(f.Trees)
+
+	mergeCount := 0
+	g := New(f, e, cfg)
+	g.OnTreeAtRisk = func(_ *forest.Tree, reason string) {
+		if reason == "merge" {
+			mergeCount++
+		}
+	}
+
+	g.ProcessPrompt("fix database migration", "px")
+
+	if mergeCount > maxMergesPerPrompt {
+		t.Errorf("merge count %d exceeded cap %d", mergeCount, maxMergesPerPrompt)
+	}
+	if mergeCount != maxMergesPerPrompt {
+		t.Errorf("expected exactly %d merges (cap-bound), got %d", maxMergesPerPrompt, mergeCount)
+	}
+}
+
 func TestClusterMergingDisabledWhenZero(t *testing.T) {
 	f := forest.NewForest()
 	e := tfidf.NewEngine()

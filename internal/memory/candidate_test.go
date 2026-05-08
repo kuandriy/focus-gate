@@ -180,8 +180,8 @@ func TestSelectCandidate_SuggestsMergeTarget(t *testing.T) {
 	if got == nil {
 		t.Fatal("expected candidate")
 	}
-	if got.SuggestedAction != "merge" {
-		t.Errorf("suggestedAction = %q, want merge", got.SuggestedAction)
+	if got.SuggestedAction != "append" {
+		t.Errorf("suggestedAction = %q, want append", got.SuggestedAction)
 	}
 	if got.SuggestedTargetID != "mem_existing" {
 		t.Errorf("suggestedTargetId = %q, want mem_existing", got.SuggestedTargetID)
@@ -206,5 +206,25 @@ func TestApplyRedact(t *testing.T) {
 	}
 	if out[1] != "nothing sensitive here" {
 		t.Errorf("innocent string should pass through, got %q", out[1])
+	}
+}
+
+func TestDefaultRedactPatterns_RedactsCommonShapes(t *testing.T) {
+	in := []string{
+		"my AWS key is AKIAIOSFODNN7EXAMPLE here",
+		"Authorization: Bearer eyJabc123def456ghi789jkl",
+		"-----BEGIN RSA PRIVATE KEY----- bla bla",
+		"set api_key=verysecretvalueabcdef123456 and",
+		"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+		"benign sentence with no secrets",
+	}
+	out := applyRedact(in, DefaultRedactPatterns)
+	for i, s := range out[:5] {
+		if !strings.Contains(s, "«redacted»") {
+			t.Errorf("[%d] expected redaction in %q (got %q)", i, in[i], s)
+		}
+	}
+	if out[5] != in[5] {
+		t.Errorf("benign line altered: %q -> %q", in[5], out[5])
 	}
 }

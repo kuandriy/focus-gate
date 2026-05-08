@@ -152,6 +152,71 @@ func TestExtractFilePaths_ZeroMaxRefs(t *testing.T) {
 	}
 }
 
+func TestExtractEndpoints_BasicShapes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "simple POST",
+			input: "wire up POST /auth/refresh handler",
+			want:  []string{"POST /auth/refresh"},
+		},
+		{
+			name:  "lowercase verb is not matched",
+			input: "wire up post /auth/refresh handler",
+			want:  nil,
+		},
+		{
+			name:  "trailing slash normalized",
+			input: "implement GET /users/ list",
+			want:  []string{"GET /users"},
+		},
+		{
+			name:  "multiple endpoints",
+			input: "Handlers: GET /healthz and POST /auth/login plus DELETE /auth/session",
+			want:  []string{"GET /healthz", "POST /auth/login", "DELETE /auth/session"},
+		},
+		{
+			name:  "deduplicates",
+			input: "POST /auth/refresh and again POST /auth/refresh",
+			want:  []string{"POST /auth/refresh"},
+		},
+		{
+			name:  "stops at trailing punctuation",
+			input: "(POST /auth/refresh) is the new endpoint",
+			want:  []string{"POST /auth/refresh"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractEndpoints(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestExtractAssets_UnionsPathsAndEndpoints(t *testing.T) {
+	got := ExtractAssets("Edit cmd/api/auth.go and route POST /auth/refresh", 10)
+	want := map[string]bool{"cmd/api/auth.go": true, "POST /auth/refresh": true}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 assets, got %v", got)
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("unexpected asset %q in %v", g, got)
+		}
+	}
+}
+
 func TestFilterExistingPaths_EmptyBaseDirIsNoOp(t *testing.T) {
 	in := []string{"a.go", "b/c.go"}
 	got := FilterExistingPaths("", in)

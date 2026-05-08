@@ -23,6 +23,15 @@ type Engine struct {
 	Schema    string         `json:"schemaVersion"`
 	DocFreq   map[string]int `json:"docFreq"`
 	TotalDocs int            `json:"totalDocs"`
+
+	// Sublinear toggles `1 + log2(count)` term-frequency weighting in
+	// place of the linear `count / total` form. Standard IR practice
+	// for dampening repeated-term dominance — a word appearing 100x
+	// shouldn't outweigh one appearing 10x by a factor of 10. Off by
+	// default to preserve existing classification behaviour;
+	// runtime-only (not persisted) so callers wire it from config
+	// after Load.
+	Sublinear bool `json:"-"`
 }
 
 // SetSchemaVersion implements persist.SchemaVersioner.
@@ -89,8 +98,18 @@ func (e *Engine) IDF(term string) float64 {
 // and returns a sorted sparse vector ready for cosine similarity.
 func (e *Engine) Vectorize(rawText string) Vector {
 	tokens := text.Tokenize(rawText)
+	return e.VectorizeTokens(tokens)
+}
+
+// VectorizeTokens converts pre-tokenized text into a sorted TF-IDF Vector.
+// Uses sublinear `1 + log2(count)` weighting when Engine.Sublinear is set,
+// linear `count / total` otherwise.
+func (e *Engine) VectorizeTokens(tokens []string) Vector {
 	if len(tokens) == 0 {
 		return nil
+	}
+	if e.Sublinear {
+		return e.vectorizeSublinear(tokens)
 	}
 	tf := text.TermFrequency(tokens)
 	weights := make(map[string]float64, len(tf))
@@ -103,18 +122,21 @@ func (e *Engine) Vectorize(rawText string) Vector {
 	return NewVector(weights)
 }
 
-// VectorizeTokens converts pre-tokenized text into a sorted TF-IDF Vector.
-func (e *Engine) VectorizeTokens(tokens []string) Vector {
-	if len(tokens) == 0 {
-		return nil
+// vectorizeSublinear builds a vector with sublinear TF weighting:
+// `tf = 1 + log2(count)`. Cosine cares only about direction, so the
+// missing /total normalization the linear form does is harmless.
+func (e *Engine) vectorizeSublinear(tokens []string) Vector {
+	counts := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		counts[t]++
 	}
-	tf := text.TermFrequency(tokens)
-	weights := make(map[string]float64, len(tf))
-	for term, freq := range tf {
+	weights := make(map[string]float64, len(counts))
+	for term, count := range counts {
 		idf := e.IDF(term)
-		if idf > 0 {
-			weights[term] = freq * idf
+		if idf <= 0 {
+			continue
 		}
+		weights[term] = (1.0 + math.Log2(float64(count))) * idf
 	}
 	return NewVector(weights)
 }

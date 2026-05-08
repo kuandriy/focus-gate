@@ -1,24 +1,26 @@
 // Package memory implements Focus Gate's long-term memory layer.
 //
-// Memories are small Markdown files stored under the project's data
-// directory that distill the valuable subset of prior Focus Gate activity
-// — completed investigations, project conventions, "we did X because Y"
-// decisions. Each file has a narrow YAML front-matter with binary-managed
-// lookup metadata, followed by a free-form Markdown body.
+// Memories are append-only stories stored as Markdown files with YAML-ish
+// frontmatter. Each story contains one or more chapters; new chapters are
+// appended over time. Old chapters never edit. Frontmatter list fields
+// (timeMarkers, interests, topics, assets) only grow — they aggregate the
+// per-chapter metadata into a per-memory index for fast lookup.
 //
 // This package owns the on-disk format, the manifest index that enables
-// fast cosine lookup, and the Surface routine that renders pointer blocks
-// into the hook's injected context. It does NOT call any LLM — all prose
-// is authored by the host (via fg: memory commit) or by the user's own
-// editor. See docs/LONG_TERM_MEMORY_PLAN.md for the full design.
+// fast lookup, and the Surface routine that renders pointer blocks into
+// the hook's injected context. It does NOT call any LLM — all prose is
+// authored by the host (via fg: memory commit) or by the user's own
+// editor. See docs/SHARED_MEMORY_PLAN.md for the full design.
 package memory
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -29,53 +31,108 @@ import (
 
 // SchemaVersion is the on-disk schema version for memory front-matter and
 // for the manifest file. Bump when the layout changes incompatibly.
-const SchemaVersion = "1"
+const SchemaVersion = "2"
 
-// IDPrefix is the leading literal of a memory ID. Makes a raw IDs
-// recognizable at a glance and scoped so future features can introduce
-// different stores without collision.
+// IDPrefix is the leading literal of a memory ID.
 const IDPrefix = "mem_"
 
-// Memory is one long-term knowledge record, parsed from a Markdown file
-// with YAML-ish front-matter. The struct is fully populated on load and
-// fully regenerated on save — binary-managed fields (Created/Updated/
-// TopTerms/Fingerprint/VocabHash/TouchedBy) are overwritten every write,
-// so whatever the caller sets in them is ignored.
-type Memory struct {
-	// Stable across rewrites.
-	ID      string   // "mem_YYYYMMDD_<6-hex>"; stamped once
-	Title   string   // ≤80 chars
-	Sources []string // tree IDs that contributed; append-only on merge
-	Refs    []string // project-relative file paths mentioned in the body
-
-	// Binary-managed. Overwritten on every save.
-	Created     time.Time
-	Updated     time.Time
-	TopTerms    []string           // top N terms by weight, human-readable
-	Fingerprint map[string]float64 // term → weight for cosine lookup
-	VocabHash   string             // snapshot of engine vocab at write time
-	TouchedBy   int                // increments when surfaced in a prompt
-
-	// Free-form markdown body after the second "---" fence. Two sections
-	// are required (### 4.2 of the plan): "## What we did" and "## Why".
-	// The rest is unvalidated.
-	Body string
+// WeightedEntry pairs a name with a weight ∈ [0,1]. Used for interests
+// and topics in the per-memory index. Weights are computed at write time
+// from chapter coverage (chapters_mentioning / total_chapters), saturated
+// at 1.0 and floored at 0.1.
+//
+// JSON shape uses lowercase field names to stay consistent with every
+// other JSON tag in the package. Older manifests written before the
+// tags were added serialized the struct with Go's default casing
+// ("Name", "Weight"), so UnmarshalJSON below accepts either form to
+// avoid silently dropping data on read.
+type WeightedEntry struct {
+	Name   string  `json:"name"`
+	Weight float64 `json:"weight"`
 }
 
-// Required sections that validation checks for. Missing either one causes
-// Validate to return a non-nil error.
-var requiredSections = []string{"## What we did", "## Why"}
+// UnmarshalJSON accepts either {"name","weight"} (current) or
+// {"Name","Weight"} (legacy) so v2 manifests written by pre-fix
+// binaries still load. Marshal always emits the lowercase form via the
+// struct tags above, so on the next save the file converges.
+func (w *WeightedEntry) UnmarshalJSON(data []byte) error {
+	var both struct {
+		Name         string  `json:"name"`
+		Weight       float64 `json:"weight"`
+		NameLegacy   string  `json:"Name"`
+		WeightLegacy float64 `json:"Weight"`
+	}
+	if err := json.Unmarshal(data, &both); err != nil {
+		return err
+	}
+	w.Name = both.Name
+	if w.Name == "" {
+		w.Name = both.NameLegacy
+	}
+	w.Weight = both.Weight
+	if w.Weight == 0 {
+		w.Weight = both.WeightLegacy
+	}
+	return nil
+}
+
+// Memory is one long-term knowledge record. The struct is fully populated
+// on load and fully regenerated on save — binary-managed fields
+// (Created/Updated/TopTerms/Fingerprint/VocabHash/TouchedBy) are
+// overwritten every write.
+//
+// Append-only invariants (enforced by AppendChapter and Validate):
+//  1. Chapters never disappear or edit. Corrections are new chapters.
+//  2. Frontmatter list fields only grow.
+//  3. ID is immutable.
+type Memory struct {
+	// Stable across rewrites.
+	ID    string // "mem_YYYYMMDD_<6-hex>"; stamped once
+	Title string // ≤80 chars
+
+	// Versioning. Bump on every chapter append.
+	Version  int
+	Chapters int
+
+	// Binary-managed timestamps. Created stamped on first write; Updated
+	// rewritten every save (= latest chapter's date).
+	Created time.Time
+	Updated time.Time
+
+	// Aggregate index fields. Computed from ChaptersList at write time;
+	// derived from body chapters at parse time. Frontmatter holds these
+	// for fast manifest reads, but the chapter list is the source of
+	// truth.
+	TimeMarkers []string
+	Interests   []WeightedEntry
+	Topics      []WeightedEntry
+	Assets      []string
+
+	// Binary-managed fingerprint & touch counter. Overwritten on every
+	// save (except TouchedBy, which is preserved via manifest tracking).
+	TopTerms    []string
+	Fingerprint map[string]float64
+	VocabHash   string
+	TouchedBy   int
+
+	// Free-form chapter body. The on-disk Markdown after the frontmatter
+	// fence; contains one or more `## Chapter N — date — title` blocks,
+	// each with `### What` and `### Why` subsections.
+	Body string
+
+	// ChaptersList is parsed from Body on load; populated by callers
+	// (AppendChapter, migration) before save. Drives aggregate computation.
+	ChaptersList []Chapter
+}
 
 // Path returns the on-disk filename for a memory inside a given directory.
-// Uses the memory's ID as the basename so the relationship is trivially
-// traceable (no filename parsing, no collisions, no rename chaos).
 func (m *Memory) Path(dir string) string {
 	return filepath.Join(dir, m.ID+".md")
 }
 
-// Validate checks the invariants the LLM can get wrong: required sections
-// present and non-empty, title length sane, body not blank. Binary-managed
-// field contents are never validated because we overwrite them.
+// Validate checks the v2 invariants: title set and bounded, at least one
+// chapter, every chapter has non-empty `### What` and `### Why`. Binary-
+// managed field contents are never validated because we overwrite them.
 func (m *Memory) Validate() error {
 	if m.Title == "" {
 		return errors.New("title required")
@@ -83,43 +140,23 @@ func (m *Memory) Validate() error {
 	if len([]rune(m.Title)) > 80 {
 		return fmt.Errorf("title too long (%d runes, max 80)", len([]rune(m.Title)))
 	}
-	if strings.TrimSpace(m.Body) == "" {
-		return errors.New("body is empty")
+	if len(m.ChaptersList) == 0 {
+		return errors.New("memory must have at least one chapter")
 	}
-	for _, section := range requiredSections {
-		if !hasSection(m.Body, section) {
-			return fmt.Errorf("required section %q missing or empty", section)
+	for i, ch := range m.ChaptersList {
+		if strings.TrimSpace(ch.What) == "" {
+			return fmt.Errorf("chapter %d missing or empty `### What`", i+1)
+		}
+		if strings.TrimSpace(ch.Why) == "" {
+			return fmt.Errorf("chapter %d missing or empty `### Why`", i+1)
 		}
 	}
 	return nil
 }
 
-// hasSection returns true if the body contains a section heading exactly
-// matching `heading` and that section has non-whitespace content before
-// the next "## " heading (or EOF).
-func hasSection(body, heading string) bool {
-	lines := strings.Split(body, "\n")
-	for i, line := range lines {
-		if strings.TrimRight(line, " \t") != heading {
-			continue
-		}
-		for j := i + 1; j < len(lines); j++ {
-			next := lines[j]
-			trimmed := strings.TrimSpace(next)
-			if strings.HasPrefix(next, "## ") {
-				break
-			}
-			if trimmed != "" {
-				return true
-			}
-		}
-		return false
-	}
-	return false
-}
-
 // ReadFile loads a Memory from disk. Returns an error if the file is
-// missing, malformed, or fails required-section validation.
+// missing, malformed, or the schema version is not "2". Use
+// MigrateV1FileToV2 to convert legacy files first.
 //
 // Binary-managed fields are populated from what's on disk; callers that
 // want a freshly-derived Fingerprint should call RefreshDerived after
@@ -132,16 +169,32 @@ func ReadFile(path string) (*Memory, error) {
 	return parseFile(data)
 }
 
-// WriteFile persists a Memory to `dir`, computing Created/Updated,
-// refreshing TopTerms and Fingerprint from the body, and stamping the
-// schemaVersion. Uses persist.SaveAtomic so a crash mid-write can't leave
-// the file half-populated.
+// WriteFile persists a Memory to `dir`, computing Created/Updated, the
+// aggregate index from ChaptersList, the body from ChaptersList, and the
+// derived fields (TopTerms, Fingerprint, VocabHash). Uses persist.SaveAtomic
+// so a crash mid-write can't leave the file half-populated.
 //
 // If m.ID is empty, a new ID is stamped from the current date and a
 // random 6-hex suffix; the ID is set back onto the caller's struct.
 // Created is set to now only on first write (i.e. when it is the zero
 // time); Updated is always refreshed.
 func WriteFile(dir string, m *Memory, vocab VocabSnapshot) error {
+	if len(m.ChaptersList) == 0 {
+		return errors.New("memory must have at least one chapter before write")
+	}
+
+	// Recompute the canonical body from chapters so the on-disk
+	// representation always matches the structured chapter list.
+	m.Body = renderChapters(m.ChaptersList)
+
+	// Recompute aggregate index from chapters. Binary-managed; we
+	// overwrite whatever the caller set.
+	aggregateFromChapters(m)
+
+	// Bump versioning to reflect the chapter count.
+	m.Version = len(m.ChaptersList)
+	m.Chapters = len(m.ChaptersList)
+
 	if err := m.Validate(); err != nil {
 		return err
 	}
@@ -152,10 +205,18 @@ func WriteFile(dir string, m *Memory, vocab VocabSnapshot) error {
 	if m.Created.IsZero() {
 		m.Created = now
 	}
-	m.Updated = now
+	// Updated mirrors the latest chapter date when present, else now.
+	if last := m.ChaptersList[len(m.ChaptersList)-1]; !last.Date.IsZero() {
+		m.Updated = last.Date.UTC().Truncate(time.Second)
+	} else {
+		m.Updated = now
+	}
 
 	RefreshDerived(m, vocab)
 
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("ensure memory dir: %w", err)
+	}
 	return persist.SaveAtomicBytes(m.Path(dir), render(m))
 }
 
@@ -163,7 +224,14 @@ func WriteFile(dir string, m *Memory, vocab VocabSnapshot) error {
 // the current engine's vocabulary snapshot. Also stamps VocabHash. The
 // caller is responsible for persisting the Memory afterwards.
 func RefreshDerived(m *Memory, vocab VocabSnapshot) {
-	weights := vocab.Vectorize(m.Body + " " + m.Title + " " + strings.Join(m.Refs, " "))
+	source := m.Body + " " + m.Title + " " + strings.Join(m.Assets, " ")
+	for _, t := range m.Topics {
+		source += " " + t.Name
+	}
+	for _, in := range m.Interests {
+		source += " " + in.Name
+	}
+	weights := vocab.Vectorize(source)
 	m.Fingerprint = weights
 	m.VocabHash = vocab.Hash
 
@@ -200,251 +268,18 @@ func (m *Memory) AsVector() tfidf.Vector {
 // ---------------------------------------------------------------------------
 
 // NewID returns a fresh memory ID using the given wall-clock time. The
-// 6-hex suffix is derived from nanosecond fraction so multiple IDs minted
-// in the same second remain distinct without requiring a source of
-// randomness.
+// 6-hex (24-bit) random suffix is sourced from crypto/rand to keep
+// collisions astronomically unlikely even when many memories are
+// created on the same day across a shared corpus.
+//
+// Falls back to nanosecond fraction if crypto/rand is unavailable
+// (extremely rare; the function never returns an empty string so
+// callers don't have to defensively check).
 func NewID(t time.Time) string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return fmt.Sprintf("%s%s_%s", IDPrefix, t.UTC().Format("20060102"), hex.EncodeToString(b[:]))
+	}
 	return fmt.Sprintf("%s%s_%06x", IDPrefix, t.UTC().Format("20060102"),
 		uint32(t.UnixNano())&0xffffff)
-}
-
-// ---------------------------------------------------------------------------
-// Front-matter parser (narrow YAML-ish subset)
-// ---------------------------------------------------------------------------
-
-// parseFile splits a memory file into front-matter + body, decodes the
-// front-matter into a Memory struct, and returns it. Validation is
-// deferred — callers that need strict validation call m.Validate().
-func parseFile(data []byte) (*Memory, error) {
-	text := string(data)
-	fm, body, err := splitFrontMatter(text)
-	if err != nil {
-		return nil, err
-	}
-
-	m := &Memory{Body: body}
-	if err := decodeFrontMatter(fm, m); err != nil {
-		return nil, err
-	}
-	if m.ID == "" {
-		return nil, errors.New("frontmatter missing id")
-	}
-	return m, nil
-}
-
-var fenceRe = regexp.MustCompile(`(?m)^---\s*$`)
-
-// splitFrontMatter expects `---\n<fm>\n---\n<body>`. Returns the
-// front-matter block without the fences and the body unchanged.
-func splitFrontMatter(text string) (fm, body string, err error) {
-	locs := fenceRe.FindAllStringIndex(text, 2)
-	if len(locs) < 2 {
-		return "", "", errors.New("missing --- frontmatter fence")
-	}
-	open := locs[0]
-	close := locs[1]
-	if open[0] != 0 {
-		return "", "", errors.New("--- fence must be at the start of file")
-	}
-	fm = strings.TrimSpace(text[open[1]:close[0]])
-	body = strings.TrimLeft(text[close[1]:], "\n")
-	return fm, body, nil
-}
-
-// decodeFrontMatter parses a narrow YAML-ish format:
-//
-//	key: value                         (scalar string)
-//	key: [item1, item2]                (flow-style list)
-//	key: 42                            (integer)
-//	key: "quoted"                      (quoted string, escapes unsupported)
-//
-// Unknown keys are preserved as comments in the on-disk file but dropped
-// on load (the rewrite path overwrites everything from the struct). This
-// is intentional — future fields land cleanly without requiring old
-// binaries to understand them.
-func decodeFrontMatter(fm string, m *Memory) error {
-	for _, line := range strings.Split(fm, "\n") {
-		line = strings.TrimRight(line, " \t")
-		if line == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
-			continue
-		}
-		colon := strings.IndexByte(line, ':')
-		if colon < 0 {
-			return fmt.Errorf("malformed frontmatter line: %q", line)
-		}
-		key := strings.TrimSpace(line[:colon])
-		value := strings.TrimSpace(line[colon+1:])
-		if err := setField(m, key, value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// setField populates one struct field by name. Silently ignores unknown
-// keys so older binaries keep working against newer files.
-func setField(m *Memory, key, rawValue string) error {
-	switch key {
-	case "schemaVersion":
-		if v := unquote(rawValue); v != "" && v != SchemaVersion {
-			return fmt.Errorf("unsupported schemaVersion %q (this binary speaks %q)", v, SchemaVersion)
-		}
-	case "id":
-		m.ID = unquote(rawValue)
-	case "title":
-		m.Title = unquote(rawValue)
-	case "sources":
-		m.Sources = parseList(rawValue)
-	case "refs":
-		m.Refs = parseList(rawValue)
-	case "topTerms":
-		m.TopTerms = parseList(rawValue)
-	case "fingerprint":
-		m.Fingerprint = parseWeightMap(unquote(rawValue))
-	case "vocabHash":
-		m.VocabHash = unquote(rawValue)
-	case "touchedBy":
-		var n int
-		_, err := fmt.Sscanf(rawValue, "%d", &n)
-		if err == nil {
-			m.TouchedBy = n
-		}
-	case "created":
-		if t, err := time.Parse(time.RFC3339, unquote(rawValue)); err == nil {
-			m.Created = t
-		}
-	case "updated":
-		if t, err := time.Parse(time.RFC3339, unquote(rawValue)); err == nil {
-			m.Updated = t
-		}
-	}
-	return nil
-}
-
-// unquote strips surrounding double quotes if present. Escapes are not
-// interpreted — quoted values here never contain embedded quotes in
-// practice (title is ≤80 chars, IDs are ASCII).
-func unquote(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
-
-// parseList reads a flow-style YAML list:  [a, b, "c d"].
-// Returns nil for an empty list, or if the value is not a list.
-func parseList(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "[") || !strings.HasSuffix(raw, "]") {
-		return nil
-	}
-	inner := strings.TrimSpace(raw[1 : len(raw)-1])
-	if inner == "" {
-		return nil
-	}
-	parts := strings.Split(inner, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		v := unquote(strings.TrimSpace(p))
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-// parseWeightMap parses "term1:0.48 term2:0.36 term3:0.12" into a map.
-// This is the storage format for the memory's fingerprint — compact,
-// YAML-safe (single quoted string), trivial to parse.
-func parseWeightMap(s string) map[string]float64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	out := map[string]float64{}
-	for _, pair := range strings.Fields(s) {
-		colon := strings.LastIndexByte(pair, ':')
-		if colon < 0 {
-			continue
-		}
-		term := pair[:colon]
-		var w float64
-		if _, err := fmt.Sscanf(pair[colon+1:], "%f", &w); err != nil {
-			continue
-		}
-		if term != "" {
-			out[term] = w
-		}
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Front-matter renderer
-// ---------------------------------------------------------------------------
-
-// render emits the complete on-disk representation: fenced frontmatter +
-// body. Field order is fixed for deterministic output — makes diffs
-// readable and tests simple.
-func render(m *Memory) []byte {
-	var b strings.Builder
-	b.WriteString("---\n")
-	fmt.Fprintf(&b, "schemaVersion: %q\n", SchemaVersion)
-	fmt.Fprintf(&b, "id: %q\n", m.ID)
-	fmt.Fprintf(&b, "title: %q\n", m.Title)
-	writeListField(&b, "sources", m.Sources)
-	writeListField(&b, "refs", m.Refs)
-	fmt.Fprintf(&b, "created: %q\n", m.Created.UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "updated: %q\n", m.Updated.UTC().Format(time.RFC3339))
-	writeListField(&b, "topTerms", m.TopTerms)
-	fmt.Fprintf(&b, "fingerprint: %q\n", formatWeightMap(m.Fingerprint))
-	fmt.Fprintf(&b, "vocabHash: %q\n", m.VocabHash)
-	fmt.Fprintf(&b, "touchedBy: %d\n", m.TouchedBy)
-	b.WriteString("---\n\n")
-	b.WriteString(strings.TrimLeft(m.Body, "\n"))
-	if !strings.HasSuffix(m.Body, "\n") {
-		b.WriteByte('\n')
-	}
-	return []byte(b.String())
-}
-
-func writeListField(b *strings.Builder, name string, items []string) {
-	if len(items) == 0 {
-		fmt.Fprintf(b, "%s: []\n", name)
-		return
-	}
-	fmt.Fprintf(b, "%s: [", name)
-	for i, it := range items {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		fmt.Fprintf(b, "%q", it)
-	}
-	b.WriteString("]\n")
-}
-
-// formatWeightMap emits "term1:0.4821 term2:0.3654 ..." with deterministic
-// ordering (descending weight, then term asc). Precision is 4 decimal
-// places — enough for cosine rank stability, tight enough to keep
-// fingerprint lines readable.
-func formatWeightMap(w map[string]float64) string {
-	if len(w) == 0 {
-		return ""
-	}
-	terms := make([]string, 0, len(w))
-	for t := range w {
-		terms = append(terms, t)
-	}
-	sort.Slice(terms, func(i, j int) bool {
-		wi, wj := w[terms[i]], w[terms[j]]
-		if wi != wj {
-			return wi > wj
-		}
-		return terms[i] < terms[j]
-	})
-	parts := make([]string, len(terms))
-	for i, t := range terms {
-		parts[i] = fmt.Sprintf("%s:%.4f", t, w[t])
-	}
-	return strings.Join(parts, " ")
 }

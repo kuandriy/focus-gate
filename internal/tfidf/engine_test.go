@@ -130,6 +130,46 @@ func TestColdStartDiscrimination(t *testing.T) {
 	}
 }
 
+// SublinearTF must dampen the effect of repeated terms. With linear TF,
+// repetition is "free" once the formula normalizes by total tokens; with
+// sublinear, repetition contributes to signal but proportionally less than
+// linearly (1 + log2(count)).
+func TestEngineVectorize_SublinearDampensRepetition(t *testing.T) {
+	e := NewEngine()
+	e.AddDocument([]string{"auth", "jwt"})
+	e.AddDocument([]string{"unrelated", "stuff"})
+
+	authW := func(v Vector) float64 {
+		for _, t := range v {
+			if t.Word == "auth" {
+				return t.Weight
+			}
+		}
+		return 0
+	}
+
+	e.Sublinear = false
+	wLinearMany := authW(e.VectorizeTokens([]string{"auth", "auth", "auth", "auth"}))
+
+	e.Sublinear = true
+	wSublinOne := authW(e.VectorizeTokens([]string{"auth"}))
+	wSublinMany := authW(e.VectorizeTokens([]string{"auth", "auth", "auth", "auth"}))
+
+	if wSublinOne == 0 {
+		t.Fatal("sublinear auth weight zero for single-token vector")
+	}
+	if wSublinMany <= wLinearMany {
+		t.Errorf("sublinear should weight repetition higher than linear normalized TF: linear=%.3f sublin=%.3f",
+			wLinearMany, wSublinMany)
+	}
+	if wSublinMany <= wSublinOne {
+		t.Errorf("sublinear-many (%.3f) should exceed sublinear-one (%.3f)", wSublinMany, wSublinOne)
+	}
+	if wSublinMany > 4*wSublinOne {
+		t.Errorf("ratio many/one = %.2f exceeds 4× — not sublinear", wSublinMany/wSublinOne)
+	}
+}
+
 func TestEngineVectorize(t *testing.T) {
 	e := NewEngine()
 	e.AddDocument([]string{"auth", "token", "jwt"})

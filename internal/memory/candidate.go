@@ -3,47 +3,76 @@ package memory
 import (
 	"math"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/kuandriy/focus-gate/internal/forest"
+	"github.com/kuandriy/focus-gate/internal/text"
 	"github.com/kuandriy/focus-gate/internal/tfidf"
 )
 
 // Candidate is the on-disk form of a tree that has been flagged as worth
-// promoting into a long-term memory. Its shape matches the bundle the
-// LLM will later receive via `fg: memory promote` (§6 of the plan).
+// promoting into a long-term memory. Its shape feeds the Stage B prompt
+// the LLM receives via `fg: memory promote` (§6 of the plan).
 //
-// Session B only produces these and persists them; Session C consumes
-// them. The struct deliberately carries more data than Surface needs so
-// the promote/commit path has everything in one place without having to
-// reach back into the live forest.
+// The LLM ultimately decides append / create / discard via a commit
+// payload; SuggestedAction is just a hint computed from the merge-match
+// search at selection time.
 type Candidate struct {
-	SchemaVersion     string             `json:"schemaVersion"`
-	TempID            string             `json:"tempId"`
-	Reason            string             `json:"reason"` // "prune" or "merge"
-	SourceTreeID      string             `json:"sourceTreeId"`
-	RootAbstraction   string             `json:"rootAbstraction"`
-	TopTerms          []string           `json:"topTerms"`
-	Refs              []string           `json:"refs"`
-	AgeHours          float64            `json:"ageHours"`
-	TotalNodeWeight   float64            `json:"totalNodeWeight"`
-	PromptCount       int                `json:"promptCount"`
-	PeakScore         float64            `json:"peakScore"`
-	NodeContents      []string           `json:"nodeContents"`
-	GuideSummaries    []string           `json:"guideSummaries,omitempty"`
-	Fingerprint       map[string]float64 `json:"fingerprint"`
-	MergeMatches      []MergeMatch       `json:"mergeMatches,omitempty"`
-	SuggestedAction   string             `json:"suggestedAction"` // "create" | "merge"
-	SuggestedTargetID string             `json:"suggestedTargetId,omitempty"`
-	CreatedAt         time.Time          `json:"createdAt"`
+	SchemaVersion         string             `json:"schemaVersion"`
+	TempID                string             `json:"tempId"`
+	Reason                string             `json:"reason"` // "prune" or "merge"
+	SourceTreeID          string             `json:"sourceTreeId"`
+	RootAbstraction       string             `json:"rootAbstraction"`
+	TopTerms              []string           `json:"topTerms"`
+	Refs                  []string           `json:"refs"`
+	AgeHours              float64            `json:"ageHours"`
+	TotalNodeWeight       float64            `json:"totalNodeWeight"`
+	PromptCount           int                `json:"promptCount"`
+	PeakScore             float64            `json:"peakScore"`
+	NodeContents          []string           `json:"nodeContents"`
+	GuideSummaries        []string           `json:"guideSummaries,omitempty"`
+	Fingerprint           map[string]float64 `json:"fingerprint"`
+	MergeMatches          []MergeMatch       `json:"mergeMatches,omitempty"`
+	SuggestedAction       string             `json:"suggestedAction"` // "create" | "append"
+	SuggestedTargetID     string             `json:"suggestedTargetId,omitempty"`
+	SuggestedTargetSource string             `json:"suggestedTargetSource,omitempty"`
+	// CommitRetries tracks how many times the LLM has tried (and failed)
+	// to commit this candidate. Incremented by the commit handler on
+	// validation errors; once it crosses the configured budget, the
+	// candidate is parked rather than discarded — the user can inspect
+	// and clear it manually.
+	CommitRetries int       `json:"commitRetries,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // MergeMatch names an existing memory the LLM may want to merge into,
 // with its similarity score so merge decisions are transparent.
+// Source is populated so the Stage B prompt can group matches by
+// origin — a candidate that's similar to memories in two different
+// sources is a meaningfully different decision than one that has
+// three matches all in the same source.
 type MergeMatch struct {
 	ID     string  `json:"id"`
+	Source string  `json:"source"`
 	Title  string  `json:"title"`
 	Cosine float64 `json:"cosine"`
+}
+
+// DefaultRedactPatterns ships a conservative baseline that catches the
+// common credential shapes in transcript paste-ins so they don't leak
+// into pending_memories.json even when the user hasn't configured any
+// redaction. These are anchored or shape-specific to keep false-
+// positive risk low against realistic developer chat.
+//
+// Callers extend these with their own patterns; both lists feed
+// applyRedact verbatim so order doesn't matter.
+var DefaultRedactPatterns = []string{
+	`AKIA[0-9A-Z]{16}`,                                      // AWS access key id
+	`\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+`, // JWT shape
+	`-----BEGIN [A-Z ]*PRIVATE KEY-----`,                    // PEM private keys
+	`(?i)bearer\s+[A-Za-z0-9._\-+/=]{20,}`,                  // Bearer tokens
+	`(?i)(?:api[_-]?key|secret|token|password)["':=\s]+[A-Za-z0-9_\-]{16,}`, // labeled secrets
 }
 
 // SelectConfig captures the candidate-selection knobs. Zero-valued fields
@@ -194,32 +223,46 @@ func SelectCandidate(in SelectInputs, cfg SelectConfig) *Candidate {
 
 	action := "create"
 	target := ""
+	targetSource := ""
 	if len(matches) > 0 {
-		action = "merge"
+		action = "append"
 		target = matches[0].ID
+		// At Phase 4 Source on IndexEntry is always populated by the
+		// manifest rebuild; older queue entries fall back to the
+		// default source name.
+		for _, e := range in.ExistingEntries {
+			if e.ID == target {
+				targetSource = e.Source
+				break
+			}
+		}
+		if targetSource == "" {
+			targetSource = DefaultSourceName
+		}
 	}
 
 	now := time.Now().UTC().Truncate(time.Second)
 	ageHours := float64(time.Now().UnixMilli()-in.Tree.Created) / 3600000.0
 	return &Candidate{
-		SchemaVersion:     SchemaVersion,
-		TempID:            newTempID(now, in.Tree.ID),
-		Reason:            in.Reason,
-		SourceTreeID:      in.Tree.ID,
-		RootAbstraction:   in.Tree.Root().Content,
-		TopTerms:          topTermsFrom(fp, cfg.TopTermsCount),
-		Refs:              refs,
-		AgeHours:          ageHours,
-		TotalNodeWeight:   totalWeight,
-		PromptCount:       indexedCount,
-		PeakScore:         in.Tree.PeakScore,
-		NodeContents:      contents,
-		GuideSummaries:    guides,
-		Fingerprint:       fp,
-		MergeMatches:      matches,
-		SuggestedAction:   action,
-		SuggestedTargetID: target,
-		CreatedAt:         now,
+		SchemaVersion:         SchemaVersion,
+		TempID:                newTempID(now, in.Tree.ID),
+		Reason:                in.Reason,
+		SourceTreeID:          in.Tree.ID,
+		RootAbstraction:       in.Tree.Root().Content,
+		TopTerms:              topTermsFrom(fp, cfg.TopTermsCount),
+		Refs:                  refs,
+		AgeHours:              ageHours,
+		TotalNodeWeight:       totalWeight,
+		PromptCount:           indexedCount,
+		PeakScore:             in.Tree.PeakScore,
+		NodeContents:          contents,
+		GuideSummaries:        guides,
+		Fingerprint:           fp,
+		MergeMatches:          matches,
+		SuggestedAction:       action,
+		SuggestedTargetID:     target,
+		SuggestedTargetSource: targetSource,
+		CreatedAt:             now,
 	}
 }
 
@@ -266,15 +309,24 @@ func suggestMergeTargets(fp map[string]float64, entries []IndexEntry, threshold 
 		}
 		sim := tfidf.CosineSimilarity(candVec, entryVec)
 		if sim >= threshold {
-			matches = append(matches, MergeMatch{ID: e.ID, Title: e.Title, Cosine: sim})
+			matches = append(matches, MergeMatch{
+				ID:     e.ID,
+				Source: e.Source,
+				Title:  e.Title,
+				Cosine: sim,
+			})
 		}
 	}
-	// Sort matches by cosine descending so the top pick is first.
-	for i := 1; i < len(matches); i++ {
-		for j := i; j > 0 && matches[j].Cosine > matches[j-1].Cosine; j-- {
-			matches[j], matches[j-1] = matches[j-1], matches[j]
+	// Group by source, then cosine desc within each source. The LLM's
+	// merge decision benefits from per-source clusters: "I have three
+	// candidates in `personal` and one in `team`" is more actionable
+	// than a flat cosine-only sort that interleaves them.
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].Source != matches[j].Source {
+			return matches[i].Source < matches[j].Source
 		}
-	}
+		return matches[i].Cosine > matches[j].Cosine
+	})
 	return matches
 }
 
@@ -326,11 +378,9 @@ func collectNodeContents(t *forest.Tree) []string {
 		if !n.Indexed {
 			continue
 		}
-		content := n.Content
-		if len(content) > 500 {
-			content = content[:500] + "…(truncated)"
-		}
-		out = append(out, content)
+		// Rune-aware truncation so a paste of multi-byte text doesn't
+		// produce invalid UTF-8 in the pending bundle.
+		out = append(out, text.TruncateRunesWithSuffix(n.Content, 500, "…(truncated)"))
 	}
 	return out
 }
@@ -368,17 +418,14 @@ func topTermsFrom(fp map[string]float64, n int) []string {
 	for t := range fp {
 		terms = append(terms, t)
 	}
-	// Sort by weight desc, term asc for deterministic tie-break.
-	for i := 1; i < len(terms); i++ {
-		for j := i; j > 0; j-- {
-			wi, wj := fp[terms[j]], fp[terms[j-1]]
-			if wi > wj || (wi == wj && terms[j] < terms[j-1]) {
-				terms[j], terms[j-1] = terms[j-1], terms[j]
-				continue
-			}
-			break
+	// Weight desc, term asc — deterministic tie-break.
+	sort.Slice(terms, func(i, j int) bool {
+		wi, wj := fp[terms[i]], fp[terms[j]]
+		if wi != wj {
+			return wi > wj
 		}
-	}
+		return terms[i] < terms[j]
+	})
 	if n > len(terms) {
 		n = len(terms)
 	}
