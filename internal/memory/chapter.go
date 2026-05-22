@@ -146,9 +146,20 @@ func aggregateFromChapters(m *Memory) {
 
 // aggregateWeighted produces a WeightedEntry slice for either interests
 // or topics. The selector returns the relevant slice from a chapter.
-// Entries whose first occurrence appears in chapter K are weighted by
-// (chapters_mentioning / total_chapters), saturated at 1.0, floored at
-// 0.1, rounded to 2 decimal places to keep on-disk output stable.
+// Entries are weighted by chapter coverage — `count/total` saturated
+// at 1.0, FLOORED at 0.5 so any topic listed in any chapter retains
+// enough aggregate weight to clear the surface threshold via the
+// topic tier alone (cosine × 0.5 × 0.8 = 0.4 ≥ default threshold 0.35).
+//
+// Why the 0.5 floor: surface scoring multiplies aggregate weight by
+// the tier weight (topics × 0.8) before comparing to threshold. A
+// pure count-based formula collapses multi-faceted reference memories
+// (4+ chapters covering distinct topics, each topic in only 1 of N
+// chapters) to per-topic weight 1/N, below the threshold-effective
+// 0.44 needed for topic-only matches. Floor at 0.5 preserves the
+// "more chapters = higher weight" gradient (0.5 → 0.625 → 0.75 →
+// 0.875 → 1.0 for 1..N of 4) while ensuring any listed topic is
+// surfaceable.
 func aggregateWeighted(chapters []Chapter, totalChapters int, sel func(Chapter) []string) []WeightedEntry {
 	if totalChapters == 0 {
 		return nil
@@ -178,12 +189,13 @@ func aggregateWeighted(chapters []Chapter, totalChapters int, sel func(Chapter) 
 	}
 	out := make([]WeightedEntry, 0, len(mentions))
 	for key, count := range mentions {
-		w := float64(count) / float64(totalChapters)
+		// Blend coverage with a constant floor: weight ≥ 0.5 for any
+		// listed term, plus a coverage bonus that scales to 1.0 when
+		// the term spans every chapter. Formula: 0.5 + 0.5 * (c/total),
+		// saturated at 1.0. See function doc for the threshold math.
+		w := 0.5 + 0.5*(float64(count)/float64(totalChapters))
 		if w > 1.0 {
 			w = 1.0
-		}
-		if w < 0.1 {
-			w = 0.1
 		}
 		w = roundTo2(w)
 		out = append(out, WeightedEntry{Name: display[key], Weight: w})

@@ -256,6 +256,88 @@ func TestSlashMemoryWhy_EmptyCatalogBranch(t *testing.T) {
 	}
 }
 
+// /focus memory add '<json>' must run the same ValidateCommit +
+// ApplyCommit pipeline as /focus memory commit but without requiring a
+// pending tempId. This is the entry point for hand-curated domain
+// memory authoring (skill catalogs, architecture docs).
+func TestSlashMemoryAdd_CreatesMemoryViaCanonicalPipeline(t *testing.T) {
+	p, _ := setupTestPaths(t)
+	engine := tfidf.NewEngine()
+
+	payload := `{
+		"action": "create",
+		"newMemory": {
+			"title": "Core: claims",
+			"chapter": {
+				"title": "Initial brief",
+				"timeMarker": "2026-05-08",
+				"assets": ["services/src/el/components/claims"],
+				"topics": [{"name": "claim adjudication", "weight": 1.0}],
+				"what": "Claims domain owns submission, history, cancellation, and adjudication integration.",
+				"why": "Core differentiator; clients pay for claims handling rigor."
+			}
+		}
+	}`
+
+	var buf bytes.Buffer
+	if err := slashMemoryAdd(&buf, p, engine, payload); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Created memory") {
+		t.Errorf("expected creation confirmation, got %q", out)
+	}
+
+	// Manifest must be rebuilt — verify by reading back.
+	mf, _ := memory.Load(p.memoryDir)
+	if len(mf.Entries) != 1 {
+		t.Fatalf("expected 1 memory in manifest after add, got %d", len(mf.Entries))
+	}
+	if mf.Entries[0].Title != "Core: claims" {
+		t.Errorf("title mismatch: got %q", mf.Entries[0].Title)
+	}
+}
+
+// add must surface ValidateCommit's structured errors verbatim — same
+// {field, reason, hint} shape the commit path produces — so a
+// pedantic-mode author can correct a malformed payload in one
+// round-trip.
+func TestSlashMemoryAdd_SurfacesValidationErrors(t *testing.T) {
+	p, _ := setupTestPaths(t)
+	engine := tfidf.NewEngine()
+
+	// Bad: action=create but missing newMemory.
+	badPayload := `{"action": "create"}`
+	var buf bytes.Buffer
+	if err := slashMemoryAdd(&buf, p, engine, badPayload); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "newMemory") {
+		t.Errorf("expected newMemory validation error, got %q", out)
+	}
+	// No memory should have been written.
+	mf, _ := memory.Load(p.memoryDir)
+	if len(mf.Entries) != 0 {
+		t.Errorf("expected zero memories after failed validation, got %d", len(mf.Entries))
+	}
+}
+
+// discard via add is a conceptual mismatch (nothing to discard from
+// when there's no pending queue lookup). Must be rejected with a clear
+// message rather than silently succeeding as a no-op.
+func TestSlashMemoryAdd_RejectsDiscardAction(t *testing.T) {
+	p, _ := setupTestPaths(t)
+	engine := tfidf.NewEngine()
+	var buf bytes.Buffer
+	if err := slashMemoryAdd(&buf, p, engine, `{"action":"discard"}`); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "discard") {
+		t.Errorf("expected discard-mismatch message, got %q", buf.String())
+	}
+}
+
 // /focus memory diff <id> renders chapter-by-chapter delta, showing
 // only newly-introduced assets/topics/interests per chapter (not the
 // running union). Closes the U-2 gap.

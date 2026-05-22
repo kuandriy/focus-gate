@@ -127,10 +127,10 @@ func TestAggregate_WeightsByChapterCoverage(t *testing.T) {
 	m := &Memory{Title: "x", ChaptersList: []Chapter{c1, c2}}
 	aggregateFromChapters(m)
 
-	// "shared" appears in 2/2 chapters → weight 1.0.
-	// "only-one" appears in 1/2 → 0.5.
-	// "shared topic" → 1.0; "only-two" → 0.5.
-	wantInterest := map[string]float64{"shared": 1.0, "only-one": 0.5}
+	// Formula: 0.5 + 0.5 * (count/total), saturated at 1.0.
+	// "shared" appears in 2/2 chapters → 0.5 + 0.5*1.0 = 1.0.
+	// "only-one" appears in 1/2 → 0.5 + 0.5*0.5 = 0.75.
+	wantInterest := map[string]float64{"shared": 1.0, "only-one": 0.75}
 	for _, in := range m.Interests {
 		want, ok := wantInterest[strings.ToLower(in.Name)]
 		if !ok {

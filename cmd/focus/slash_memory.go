@@ -21,6 +21,7 @@ import (
 var memoryMutators = map[string]bool{
 	"discard":    true,
 	"commit":     true,
+	"add":        true,
 	"reindex":    true,
 	"migrate-v1": true,
 	"forget":     true,
@@ -89,6 +90,8 @@ func slashMemory(w io.Writer, p paths, cfg config, e *tfidf.Engine, arg string) 
 		return slashMemoryPromote(w, p, cfg, e, rest)
 	case "commit":
 		return slashMemoryCommit(w, p, cfg, e, rest)
+	case "add":
+		return slashMemoryAdd(w, p, e, rest)
 	case "forget":
 		return slashMemoryForget(w, p, e, rest)
 	case "why":
@@ -99,7 +102,7 @@ func slashMemory(w io.Writer, p paths, cfg config, e *tfidf.Engine, arg string) 
 		return slashMemorySource(w, p, rest)
 	default:
 		fmt.Fprintf(w, "[Focus] Unknown memory subcommand: %q\n", sub)
-		fmt.Fprintln(w, "Available: fg: memory [list | show <id> | diff <id> | pending | promote [tempId] | commit <tempId> <json> | discard <id|all> | forget <id> [--yes] | why \"prompt\" | health | reindex [--source <name>] | migrate-v1 | source ...]")
+		fmt.Fprintln(w, "Available: fg: memory [list | show <id> | diff <id> | pending | promote [tempId] | commit <tempId> <json> | add <json> | discard <id|all> | forget <id> [--yes] | why \"prompt\" | health | reindex [--source <name>] | migrate-v1 | source ...]")
 		return nil
 	}
 }
@@ -887,6 +890,90 @@ func slashMemoryMigrateV1(w io.Writer, p paths, e *tfidf.Engine) error {
 		mf, _ := memory.Load(p.memoryDir)
 		_ = mf.Rebuild(p.memoryDir, vocab)
 		_ = mf.Save(p.memoryDir)
+	}
+	return nil
+}
+
+// slashMemoryAdd persists a manually-authored memory through the same
+// validate-and-apply pipeline the LLM-driven `commit` path uses, but
+// without requiring a pending-queue tempId. This is the entry point for
+// hand-curating domain memories (e.g. converting skill/architecture
+// docs into a memory catalog) where there's no forest-detected
+// candidate to point at.
+//
+// Payload shape is identical to `commit` — action "create" or "append"
+// (discard is not meaningful here; nothing to discard from). All
+// validation, schema, and writer code is shared with the commit path,
+// so a memory produced by `add` is bit-for-bit indistinguishable from
+// one the runtime would write.
+//
+// Usage:
+//
+//	/focus memory add '<json>'
+//
+// JSON is the same shape printed by `BuildStageBPrompt`. Single-quote
+// wrapping is supported (Claude Code slash transport strips them).
+func slashMemoryAdd(w io.Writer, p paths, e *tfidf.Engine, arg string) error {
+	jsonText := strings.TrimSpace(arg)
+	jsonText = strings.Trim(jsonText, "'")
+	if jsonText == "" {
+		fmt.Fprintln(w, "[Focus] Usage: /focus memory add '<json>'")
+		fmt.Fprintln(w, "  JSON shape: {\"action\":\"create\"|\"append\", ...}")
+		fmt.Fprintln(w, "  See /focus memory promote output for the canonical schema + examples.")
+		return nil
+	}
+
+	payload, parseErrs := memory.ParseCommitJSON([]byte(jsonText))
+	if len(parseErrs) > 0 {
+		emitCommitErrors(w, parseErrs)
+		return nil
+	}
+
+	// `discard` is meaningful only in the commit path (removes a pending
+	// candidate). Adding a discard via this command would be a no-op —
+	// reject explicitly so the user notices the conceptual mismatch.
+	if payload.Action == memory.CommitActionDiscard {
+		fmt.Fprintln(w, "[Focus] action=\"discard\" has no effect via /focus memory add — discard is only meaningful for pending candidates. Use /focus memory discard <tempId> instead.")
+		return nil
+	}
+
+	registry, _ := memory.LoadSources(p.dataDir, p.memoryDir)
+	vocab := memory.NewVocabSnapshot(e)
+	manifests, _ := registry.LoadEnabledManifests(vocab)
+	msi := memory.NewMultiSourceIndex(manifests...)
+	if errs := memory.ValidateCommit(payload, msi); len(errs) > 0 {
+		emitCommitErrors(w, errs)
+		return nil
+	}
+
+	ctx := memory.CommitContext{
+		SourceDirs:    registry.SourceDirs(),
+		DefaultSource: registry.Default,
+		Vocab:         vocab,
+		Index:         msi,
+	}
+	res, err := memory.ApplyCommit(payload, ctx)
+	if err != nil {
+		fmt.Fprintf(w, "[Focus] Apply failed: %v\n", err)
+		return nil
+	}
+
+	switch res.Action {
+	case memory.CommitActionAppend:
+		fmt.Fprintf(w, "[Focus] Appended chapter to %s [%s] (now %d chapters) at %s\n",
+			res.Memory.ID, res.Source, res.Memory.Chapters, res.FilePath)
+	case memory.CommitActionCreate:
+		fmt.Fprintf(w, "[Focus] Created memory %s [%s] at %s\n",
+			res.Memory.ID, res.Source, res.FilePath)
+	}
+
+	// Rebuild the affected source's manifest so the new/updated memory
+	// is immediately surfaceable on the next prompt — matches the
+	// post-commit behaviour in slashMemoryCommit.
+	if dir, ok := registry.SourceDirs()[res.Source]; ok {
+		fresh, _ := memory.Load(dir)
+		_ = fresh.Rebuild(dir, vocab)
+		_ = fresh.Save(dir)
 	}
 	return nil
 }

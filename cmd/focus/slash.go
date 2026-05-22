@@ -532,7 +532,7 @@ func slashHelp(w io.Writer) error {
 	fmt.Fprintln(w, "  /focus score \"prompt\"  Dry-run classification scoring")
 	fmt.Fprintln(w, "  /focus last            Recent classifications (action + score)")
 	fmt.Fprintln(w, "  /focus health          System diagnostics and pruning forecast")
-	fmt.Fprintln(w, "  /focus memory ...      Long-term memory: list | show <id> | diff <id> | pending | promote [tempId] | commit <tempId> '<json>' | discard <id|all> | forget <id> [--yes] | why \"prompt\" | health | reindex [--source <name>] | migrate-v1 | source ...")
+	fmt.Fprintln(w, "  /focus memory ...      Long-term memory: list | show <id> | diff <id> | pending | promote [tempId] | commit <tempId> '<json>' | add '<json>' | discard <id|all> | forget <id> [--yes] | why \"prompt\" | health | reindex [--source <name>] | migrate-v1 | source ...")
 	fmt.Fprintln(w, "  /focus help            This help message")
 	return nil
 }
